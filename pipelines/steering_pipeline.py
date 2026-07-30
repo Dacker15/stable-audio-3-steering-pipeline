@@ -23,10 +23,23 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
     window, generation is identical to the base `MusicLDMPipeline`.
     """
 
-    def _encode_steering_target(self, steering_target, device, dtype, batch_size):
+    def _encode_steering_target(self, steering_target, batch_size, num_waveforms_per_prompt, device, dtype):
+        if isinstance(steering_target, str):
+            steering_targets = [steering_target] * batch_size
+        elif isinstance(steering_target, list):
+            if len(steering_target) != batch_size:
+                raise ValueError(
+                    f"`steering_target` has batch size {len(steering_target)}, but `prompt` has batch size"
+                    f" {batch_size}. Please make sure that passed `steering_target` matches the batch size of"
+                    " `prompt`."
+                )
+            steering_targets = steering_target
+        else:
+            raise ValueError(f"`steering_target` has to be of type `str` or `list` but is {type(steering_target)}")
+
         with torch.no_grad():
             text_inputs = self.tokenizer(
-                steering_target,
+                steering_targets,
                 padding="max_length",
                 max_length=self.tokenizer.model_max_length,
                 truncation=True,
@@ -37,7 +50,11 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                 attention_mask=text_inputs.attention_mask.to(device),
             )
         target_embed = target_embed.to(dtype=dtype, device=device)
-        target_embed = target_embed.expand(batch_size, -1)
+
+        # duplicate target embeddings for each generation per prompt, using mps friendly method
+        seq_len = target_embed.shape[1]
+        target_embed = target_embed.repeat(1, num_waveforms_per_prompt)
+        target_embed = target_embed.view(batch_size * num_waveforms_per_prompt, seq_len)
         return target_embed
 
     def __call__(
@@ -58,7 +75,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         callback_steps: int | None = 1,
         cross_attention_kwargs: dict[str, Any] | None = None,
         output_type: str | None = "np",
-        steering_target: str = None,
+        steering_target: str | list[str] = None,
         steering_model: torch.nn.Module = None,
         steering_frac_start: float = 0.0,
         steering_frac_end: float = 1.0,
@@ -68,7 +85,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         Extends `MusicLDMPipeline.__call__` with concept steering.
 
         Args:
-            steering_target (`str`): The concept the `steering_model` should steer generation towards/away from.
+            steering_target (`str` or `list[str]`): The concept(s) the `steering_model` should steer generation towards/away from. If a list, must match the batch size of `prompt`.
             steering_model (`torch.nn.Module`): Model called as `steering_model(latents=..., t=..., target_embed=...)` to predict `alpha_t`.
             steering_frac_start (`float`, *optional*, defaults to 0.0): Fraction of the denoising loop (by step index) where steering begins.
             steering_frac_end (`float`, *optional*, defaults to 1.0): Fraction of the denoising loop (by step index) where steering ends.
@@ -122,9 +139,10 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
 
         target_embed = self._encode_steering_target(
             steering_target,
+            batch_size,
+            num_waveforms_per_prompt,
             device,
             prompt_embeds.dtype,
-            batch_size * num_waveforms_per_prompt,
         )
 
         # 4. Prepare timesteps
