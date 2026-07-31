@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import ClapModel, RobertaTokenizer
+from transformers import ClapFeatureExtractor, ClapModel, RobertaTokenizer
 
 
 class ClapLoss(nn.Module):
@@ -12,13 +12,17 @@ class ClapLoss(nn.Module):
     target concept, returns `1 - cosine_similarity(audio_embeds, text_embeds)`, so that minimizing
     the loss pulls the generated audio towards the text.
 
-    The text tower is frozen: gradients only flow back through `audio_embeds`.
+    Both towers are frozen: gradients only flow back through the waveform that produced
+    `audio_embeds`. Use `encode_audio` to obtain those embeddings differentiably.
 
     Args:
-        text_encoder (`~transformers.ClapModel`): CLAP model used to embed the text. Typically the
-            `text_encoder` of a `MusicLDMPipeline`, so that both sides live in the same embedding
-            space as the pipeline's prompt embeddings.
+        text_encoder (`~transformers.ClapModel`): CLAP model used to embed the text and the audio.
+            Typically the `text_encoder` of a `MusicLDMPipeline`, so that both sides live in the same
+            embedding space as the pipeline's prompt embeddings.
         tokenizer (`~transformers.RobertaTokenizer`): Tokenizer matching `text_encoder`.
+        feature_extractor (`~transformers.ClapFeatureExtractor`): Feature extractor matching
+            `text_encoder`. Only its parameters are used, so that `encode_audio` can reproduce it
+            with differentiable ops; it is never called.
         reduction (`str`, *optional*, defaults to `"mean"`): How to reduce the per-item losses. One
             of `"mean"`, `"sum"` or `"none"`.
     """
@@ -27,6 +31,7 @@ class ClapLoss(nn.Module):
         self,
         text_encoder: ClapModel,
         tokenizer: RobertaTokenizer,
+        feature_extractor: ClapFeatureExtractor,
         reduction: str = "mean",
     ):
         super().__init__()
@@ -36,11 +41,112 @@ class ClapLoss(nn.Module):
 
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
+        self.feature_extractor = feature_extractor
         self.reduction = reduction
 
-        # the text tower is only used to produce a fixed target embedding
+        # both towers only produce embeddings, they are never updated
         self.text_encoder.requires_grad_(False)
         self.text_encoder.eval()
+
+        # `ClapFeatureExtractor` builds these with numpy, so mirror them as buffers to keep
+        # `encode_audio` on the autograd graph. `mel_filters_slaney` is the bank the reference
+        # implementation uses for every truncation mode except `"fusion"`, and CLAP's
+        # `window_function(n, "hann")` is `np.hanning(n + 1)[:n]`, i.e. a periodic Hann window
+        self.register_buffer(
+            "mel_filters",
+            torch.from_numpy(feature_extractor.mel_filters_slaney).float(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "window",
+            torch.hann_window(feature_extractor.fft_window_size, periodic=True),
+            persistent=False,
+        )
+
+    def encode_audio(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+        r"""
+        Embeds `waveform` with the CLAP audio tower, differentiably with respect to `waveform`.
+
+        Reproduces `ClapFeatureExtractor` with `truncation="rand_trunc"` and `padding="repeatpad"`
+        using `torch` ops, since the reference implementation runs in numpy and would detach the
+        waveform from the graph.
+
+        The resampling step is a linear interpolation rather than a band-limited resampler, so
+        upsampling a `sampling_rate`-bandlimited waveform leaves imaging artifacts in the mel bins
+        above `sampling_rate / 2`. This shifts the absolute cosine similarity slightly but is
+        constant across calls, so it does not bias the training signal.
+
+        Args:
+            waveform (`torch.Tensor`): Waveform of shape `(batch_size, num_samples)`.
+            sampling_rate (`int`): Sampling rate of `waveform`, e.g. `vocoder.config.sampling_rate`
+                of a `MusicLDMPipeline`.
+
+        Returns:
+            `torch.Tensor`: Normalized audio embeddings of shape `(batch_size, embed_dim)`.
+        """
+        if waveform.ndim != 2:
+            raise ValueError(
+                f"`waveform` has to be of shape `(batch_size, num_samples)` but has {waveform.ndim} dimensions"
+            )
+
+        # `torch.stft` needs float32; the tower's own dtype is matched at its input in step 5
+        waveform = waveform.to(self.window.dtype)
+
+        # 1. resample to the rate the mel filters were built for
+        if sampling_rate != self.feature_extractor.sampling_rate:
+            waveform = F.interpolate(
+                waveform.unsqueeze(1),
+                scale_factor=self.feature_extractor.sampling_rate / sampling_rate,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)
+
+        # 2. repeat-pad (or truncate) to the fixed window the audio tower expects. the reference
+        # implementation tiles `floor(max_samples / num_samples)` times and zero-pads the remainder,
+        # rather than tiling once more and truncating, so a partial final repeat becomes silence
+        num_samples = waveform.shape[-1]
+        max_samples = self.feature_extractor.nb_max_samples
+        if num_samples < max_samples:
+            waveform = waveform.repeat(1, max_samples // num_samples)
+            waveform = F.pad(waveform, (0, max_samples - waveform.shape[-1]))
+        else:
+            # the reference implementation takes a random crop here; a deterministic one keeps the
+            # training signal reproducible across epochs
+            waveform = waveform[:, :max_samples]
+
+        # 3. power spectrogram. `real ** 2 + imag ** 2` instead of `abs() ** 2` because `abs()` is
+        # not differentiable at zero magnitude and would produce NaN gradients on silent bins
+        stft = torch.stft(
+            waveform,
+            n_fft=self.feature_extractor.fft_window_size,
+            hop_length=self.feature_extractor.hop_length,
+            win_length=self.feature_extractor.fft_window_size,
+            window=self.window,
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        )
+        power = stft.real.pow(2) + stft.imag.pow(2)
+
+        # 4. mel projection and conversion to decibels, i.e. `10 * log10(power / reference)` with the
+        # reference of 1.0 and the floor of 1e-10 the reference implementation uses
+        mel = (self.mel_filters.transpose(0, 1) @ power).clamp(min=1e-10)
+        log_mel = 10.0 * torch.log10(mel)
+
+        # 5. `(batch_size, 1, num_frames, num_mel_bins)`, as returned by the feature extractor. the
+        # spectrogram is always computed in float32, so match the tower's dtype only at its input
+        input_features = log_mel.transpose(-1, -2).unsqueeze(1)
+        input_features = input_features.to(next(self.text_encoder.parameters()).dtype)
+
+        # `is_longer` is only read when the audio tower was trained with feature fusion, which
+        # `laion/clap-htsat-unfused` was not
+        audio_embeds = self.text_encoder.get_audio_features(input_features=input_features, is_longer=None)
+
+        # transformers >= 5 returns a `BaseModelOutputWithPooling`, earlier versions a plain tensor
+        if not torch.is_tensor(audio_embeds):
+            audio_embeds = audio_embeds.pooler_output
+
+        return F.normalize(audio_embeds, dim=-1)
 
     def encode_text(self, text: list[str]) -> torch.Tensor:
         r"""
