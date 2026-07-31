@@ -11,3 +11,9 @@ wheels/
 
 # Editor Configurations
 .idea
+
+# Training datasets
+datasets/
+
+# Training artifacts
+outputs/

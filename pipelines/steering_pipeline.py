@@ -16,6 +16,20 @@ else:
     XLA_AVAILABLE = False
 
 
+@dataclass
+class SteeringAudioPipelineOutput(AudioPipelineOutput):
+    r"""
+    Output class for `SteeringMusicLDMPipeline`.
+
+    Args:
+        audios (`np.ndarray` or `torch.Tensor`): Generated audio, or latents when `output_type="latent"`.
+        alpha_records (`list[tuple[float, float]]`): `(timestep, alpha_t)` pairs recorded at every
+            steering-active denoising step, in denoising order (noisiest to cleanest).
+    """
+
+    alpha_records: list[tuple[float, float]] = None
+
+
 class SteeringMusicLDMPipeline(MusicLDMPipeline):
     r"""
     `MusicLDMPipeline` variant that steers denoising towards/away from a target concept
@@ -196,6 +210,9 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        records: list[tuple[float, float]] = []
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -223,6 +240,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                     if steering_active:
                         with torch.set_grad_enabled(train):
                             alpha_t = steering_model(latents=latents, t=t, target_embed=target_embed)
+                            records.append((float(t), float(alpha_t.detach().float().mean())))
                         effective_guidance_scale = (1.0 - 2.0 * alpha_t) * guidance_scale
                     else:
                         effective_guidance_scale = guidance_scale
@@ -246,30 +264,28 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
 
         # 8. Post-processing
         with torch.no_grad():
-            if not output_type == "latent":
+            if output_type == "latent":
+                audio = latents
+            else:
                 latents = 1 / self.vae.config.scaling_factor * latents
                 mel_spectrogram = self.vae.decode(latents).sample
-            else:
-                return AudioPipelineOutput(audios=latents)
+                audio = self.mel_spectrogram_to_waveform(mel_spectrogram)
+                audio = audio[:, :original_waveform_length]
 
-            audio = self.mel_spectrogram_to_waveform(mel_spectrogram)
-
-            audio = audio[:, :original_waveform_length]
-
-            # 9. Automatic scoring
-            if num_waveforms_per_prompt > 1 and prompt is not None:
-                audio = self.score_waveforms(
-                    text=prompt,
-                    audio=audio,
-                    num_waveforms_per_prompt=num_waveforms_per_prompt,
-                    device=device,
-                    dtype=prompt_embeds.dtype,
-                )
+                # 9. Automatic scoring
+                if num_waveforms_per_prompt > 1 and prompt is not None:
+                    audio = self.score_waveforms(
+                        text=prompt,
+                        audio=audio,
+                        num_waveforms_per_prompt=num_waveforms_per_prompt,
+                        device=device,
+                        dtype=prompt_embeds.dtype,
+                    )
 
         if output_type == "np":
             audio = audio.numpy()
 
         if not return_dict:
-            return (audio,)
+            return (audio, records)
 
-        return AudioPipelineOutput(audios=audio)
+        return SteeringAudioPipelineOutput(audios=audio, alpha_records=records)
