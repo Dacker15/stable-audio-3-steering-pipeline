@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     data = parser.add_argument_group("data and output")
     data.add_argument("--dataset", type=Path, required=True, help="CSV file with `prompt` and `target` columns")
     data.add_argument("--output", type=Path, default=Path("outputs"), help="folder for weights and plots")
-    data.add_argument("--batch-size", type=int, default=2, help="prompts generated per forward pass")
+    data.add_argument("--batch-size", type=int, default=1, help="prompts generated per forward pass")
     data.add_argument("--max-samples", type=int, default=None, help="use only the first N rows of the dataset")
 
     steering = parser.add_argument_group("steering")
@@ -86,15 +86,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "weight of an auxiliary term pulling the audio towards the full prompt. pure suppression has a degenerate"
-            " optimum at alpha_max, where guidance is fully inverted and the audio is incoherent rather than merely"
-            " free of the target; raise this if the alpha schedule saturates"
+            "weight of an auxiliary term pulling the audio towards the full prompt. pure suppression can be solved by"
+            " degrading the audio rather than by removing the target concept from it; raise this if the alpha schedule"
+            " saturates at either end of its range"
         ),
     )
 
     generation = parser.add_argument_group("generation")
     generation.add_argument("--num-inference-steps", type=int, default=200, help="denoising steps per generation")
-    generation.add_argument("--audio-length-in-s", type=float, default=5.0)
+    generation.add_argument(
+        "--audio-length-in-s",
+        type=float,
+        default=10.0,
+        help=(
+            "the default maps exactly onto the 10s window of CLAP's audio tower, so the whole clip is"
+            " scored and nothing is generated that the loss cannot see"
+        ),
+    )
     generation.add_argument("--guidance-scale", type=float, default=2.0, help="must exceed 1.0 to enable steering")
 
     runtime = parser.add_argument_group("runtime")
@@ -290,14 +298,17 @@ def main() -> None:
     )
     print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
 
-    pipe = SteeringMusicLDMPipeline.from_pretrained("ucsd-reach/musicldm", torch_dtype=torch.float16).to(device)
+    # float32 throughout: the gradient reaches `alpha_t` through the scheduler recurrence, the VAE,
+    # the vocoder and the CLAP tower, and in half precision that chain returns a gradient whose sign
+    # disagrees with a finite-difference check of the same loss more often than not
+    pipe = SteeringMusicLDMPipeline.from_pretrained("ucsd-reach/musicldm", torch_dtype=torch.float32).to(device)
     pipe.set_progress_bar_config(disable=True)
     for module in (pipe.unet, pipe.vae, pipe.vocoder, pipe.text_encoder):
         module.requires_grad_(False)
         module.eval()
 
-    # the predictor stays in float32 even when the pipeline is halved: it casts its inputs and its
-    # output back to the latents' dtype itself, so only the trained weights keep full precision
+    # the predictor casts its inputs and its output to the latents' dtype itself, so it keeps
+    # working unchanged if the pipeline above is ever loaded in half precision again
     predictor_config = {
         "latent_channels": pipe.unet.config.in_channels,
         "target_embed_dim": pipe.text_encoder.config.projection_dim,

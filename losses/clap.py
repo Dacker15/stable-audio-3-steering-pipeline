@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -63,6 +65,74 @@ class ClapLoss(nn.Module):
             persistent=False,
         )
 
+        # built on first use, since the rate to resample *from* is only known per call. kept on the
+        # CPU in double precision and cast at the call site; a few hundred taps make that free
+        self._resample_kernels: dict[tuple[int, int], torch.Tensor] = {}
+
+    @staticmethod
+    def _build_resample_kernel(up: int, down: int, half_width: int = 32) -> torch.Tensor:
+        r"""
+        Builds the windowed-sinc lowpass of a rational `up / down` resampler.
+
+        The filter runs at the zero-stuffed rate and has to suppress everything above the lower of
+        the two Nyquist frequencies: the images that zero-stuffing creates when upsampling, and the
+        content that would alias when decimating.
+
+        Args:
+            up (`int`): Zero-stuffing factor, i.e. the numerator of the rate ratio.
+            down (`int`): Decimation factor, i.e. the denominator of the rate ratio.
+            half_width (`int`, *optional*, defaults to 32): Number of periods of the sinc kept on
+                each side of its centre. Wider is sharper; 32 puts the transition band well inside
+                the gap between the two rates for the 3x ratio MusicLDM needs.
+
+        Returns:
+            `torch.Tensor`: Kernel of shape `(2 * half_width * max(up, down) + 1,)`, odd-length so
+            the group delay is an integer number of samples.
+        """
+        stride = max(up, down)
+        num_taps = 2 * half_width * stride + 1
+
+        positions = torch.arange(num_taps, dtype=torch.float64) - (num_taps - 1) / 2
+        kernel = torch.sinc(positions / stride)
+        kernel = kernel * torch.hamming_window(num_taps, periodic=False, dtype=torch.float64)
+
+        # the `up - 1` inserted zeros divide the passband gain by `up`, so normalize it back
+        return kernel / kernel.sum() * up
+
+    def _resample(self, waveform: torch.Tensor, orig_rate: int, target_rate: int) -> torch.Tensor:
+        r"""
+        Band-limited rational resampling, differentiably with respect to `waveform`.
+
+        Args:
+            waveform (`torch.Tensor`): Waveform of shape `(batch_size, num_samples)`.
+            orig_rate (`int`): Sampling rate of `waveform`.
+            target_rate (`int`): Sampling rate to resample to.
+
+        Returns:
+            `torch.Tensor`: Waveform of shape `(batch_size, num_samples * up // down)`.
+        """
+        divisor = math.gcd(orig_rate, target_rate)
+        up, down = target_rate // divisor, orig_rate // divisor
+
+        if up == 1 and down == 1:
+            return waveform
+
+        if (up, down) not in self._resample_kernels:
+            self._resample_kernels[(up, down)] = self._build_resample_kernel(up, down)
+        kernel = self._resample_kernels[(up, down)].to(device=waveform.device, dtype=waveform.dtype)
+
+        batch_size, num_samples = waveform.shape
+        upsampled = waveform.new_zeros(batch_size, num_samples * up)
+        upsampled[:, ::up] = waveform
+
+        # a linear-phase kernel of odd length is symmetric, so padding by half its width and
+        # convolving without further padding lands the output back on the input grid
+        padding = kernel.shape[-1] // 2
+        upsampled = F.pad(upsampled.unsqueeze(1), (padding, padding), mode="reflect")
+        filtered = F.conv1d(upsampled, kernel.view(1, 1, -1)).squeeze(1)
+
+        return filtered[:, ::down]
+
     def encode_audio(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
         r"""
         Embeds `waveform` with the CLAP audio tower, differentiably with respect to `waveform`.
@@ -71,10 +141,11 @@ class ClapLoss(nn.Module):
         using `torch` ops, since the reference implementation runs in numpy and would detach the
         waveform from the graph.
 
-        The resampling step is a linear interpolation rather than a band-limited resampler, so
-        upsampling a `sampling_rate`-bandlimited waveform leaves imaging artifacts in the mel bins
-        above `sampling_rate / 2`. This shifts the absolute cosine similarity slightly but is
-        constant across calls, so it does not bias the training signal.
+        Resampling is band-limited (`_resample`). A cheaper interpolation would leave spectral
+        images of the whole signal above `sampling_rate / 2`, which is not a harmless constant
+        offset: CLAP's mel bank spans to 24 kHz while MusicLDM's vocoder only produces content below
+        8 kHz, so most of the bank would be reading artifacts, and because those images are
+        reflections of the content itself they corrupt every clip differently.
 
         Args:
             waveform (`torch.Tensor`): Waveform of shape `(batch_size, num_samples)`.
@@ -93,13 +164,7 @@ class ClapLoss(nn.Module):
         waveform = waveform.to(self.window.dtype)
 
         # 1. resample to the rate the mel filters were built for
-        if sampling_rate != self.feature_extractor.sampling_rate:
-            waveform = F.interpolate(
-                waveform.unsqueeze(1),
-                scale_factor=self.feature_extractor.sampling_rate / sampling_rate,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)
+        waveform = self._resample(waveform, sampling_rate, self.feature_extractor.sampling_rate)
 
         # 2. repeat-pad (or truncate) to the fixed window the audio tower expects. the reference
         # implementation tiles `floor(max_samples / num_samples)` times and zero-pads the remainder,

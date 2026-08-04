@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+import torch.utils.checkpoint
 from diffusers import MusicLDMPipeline
 from diffusers.pipelines.pipeline_utils import AudioPipelineOutput
 from diffusers.utils import is_torch_xla_available
@@ -238,9 +239,31 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                     steering_active = steering_frac_start <= step_frac < steering_frac_end
 
                     if steering_active:
-                        with torch.set_grad_enabled(train):
-                            alpha_t = steering_model(latents=latents, t=t, target_embed=target_embed)
-                            records.append((float(t), float(alpha_t.detach().float().mean())))
+                        if train:
+                            # the predictor runs once per steered step and every one of those
+                            # activations would be held until the backward pass; recomputing them
+                            # instead is what makes an unrolled trajectory of this length fit.
+                            #
+                            # both details below are load-bearing. `use_reentrant=False`: on the
+                            # first steered step `latents` carries no grad history, and the
+                            # reentrant implementation would silently return no gradient for the
+                            # predictor's own parameters. `t` passed as an argument rather than
+                            # captured: the recomputation runs during the backward pass, by which
+                            # point a captured loop variable holds the *last* timestep, and every
+                            # recomputed step would be conditioned on the wrong one
+                            alpha_t = torch.utils.checkpoint.checkpoint(
+                                lambda hidden_states, timestep, embed: steering_model(
+                                    latents=hidden_states, t=timestep, target_embed=embed
+                                ),
+                                latents,
+                                t,
+                                target_embed,
+                                use_reentrant=False,
+                            )
+                        else:
+                            with torch.no_grad():
+                                alpha_t = steering_model(latents=latents, t=t, target_embed=target_embed)
+                        records.append((float(t), float(alpha_t.detach().float().mean())))
                         effective_guidance_scale = (1.0 - 2.0 * alpha_t) * guidance_scale
                     else:
                         effective_guidance_scale = guidance_scale
