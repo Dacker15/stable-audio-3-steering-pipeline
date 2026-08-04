@@ -52,9 +52,11 @@ SAMPLE_FIELDS = [
     "method",
     "prompt",
     "target",
+    "retain_prompt",
     "audio_path",
     "target_similarity",
     "prompt_similarity",
+    "retain_similarity",
     "rms",
     "peak",
     "silence_ratio",
@@ -295,10 +297,12 @@ def summarize(
     for method, method_rows in by_method.items():
         target = _mean_ci_by_prompt(method_rows, lambda row: row["target_similarity"], bootstrap_samples, rng)
         prompt = _mean_ci_by_prompt(method_rows, lambda row: row["prompt_similarity"], bootstrap_samples, rng)
+        retain = _mean_ci_by_prompt(method_rows, lambda row: row["retain_similarity"], bootstrap_samples, rng)
         method_summary = {
             "num_generations": len(method_rows),
             "target_similarity": target,
             "prompt_similarity": prompt,
+            "retain_similarity": retain,
             "rms_mean": float(np.mean([row["rms"] for row in method_rows])),
             "peak_mean": float(np.mean([row["peak"] for row in method_rows])),
             "silence_ratio_mean": float(np.mean([row["silence_ratio"] for row in method_rows])),
@@ -315,6 +319,7 @@ def summarize(
                         **row,
                         "target_gain": float(base["target_similarity"] - row["target_similarity"]),
                         "prompt_change": float(row["prompt_similarity"] - base["prompt_similarity"]),
+                        "retain_change": float(row["retain_similarity"] - base["retain_similarity"]),
                     }
                 )
             method_summary["target_suppression_gain"] = _mean_ci_by_prompt(
@@ -322,6 +327,9 @@ def summarize(
             )
             method_summary["prompt_similarity_change"] = _mean_ci_by_prompt(
                 paired, lambda row: row["prompt_change"], bootstrap_samples, rng
+            )
+            method_summary["retain_similarity_change"] = _mean_ci_by_prompt(
+                paired, lambda row: row["retain_change"], bootstrap_samples, rng
             )
 
             prompt_gains: dict[int, list[float]] = defaultdict(list)
@@ -377,11 +385,13 @@ def plot_tradeoff(summary: dict, path: Path) -> None:
     for index, method in enumerate(methods):
         method_summary = summary["methods"][method]
         x = method_summary["target_suppression_gain"]["mean"]
-        y = method_summary["prompt_similarity_change"]["mean"]
+        # the retain prompt, not the full prompt: the full prompt still contains the target, so
+        # improving on it partly means failing to suppress
+        y = method_summary["retain_similarity_change"]["mean"]
         ax.scatter(x, y, s=70, color=PLOT_COLORS[index % len(PLOT_COLORS)])
         ax.annotate(method, (x, y), xytext=(6, 5), textcoords="offset points")
     ax.set_xlabel("Target suppression gain vs base (higher is better)")
-    ax.set_ylabel("Full-prompt similarity change vs base")
+    ax.set_ylabel("Retain-prompt similarity change vs base (higher is better)")
     ax.set_title("Suppression/fidelity trade-off")
     ax.grid(alpha=0.25)
     fig.tight_layout()
@@ -439,18 +449,21 @@ def write_report(path: Path, config: dict, summary: dict) -> None:
         [
             "## Summary",
             "",
-            "| Method | Target similarity | Suppression gain | Prompt-similarity change | Silence ratio | Clipping ratio |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| Method | Target similarity | Suppression gain | Retain similarity | Retain-similarity change |"
+            " Silence ratio | Clipping ratio |",
+            "|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for method, values in summary["methods"].items():
         target = values["target_similarity"]["mean"]
         gain = values.get("target_suppression_gain", {}).get("mean")
-        prompt_change = values.get("prompt_similarity_change", {}).get("mean")
+        retain = values["retain_similarity"]["mean"]
+        retain_change = values.get("retain_similarity_change", {}).get("mean")
         lines.append(
             f"| {method} | {target:.4f} | "
             f"{'—' if gain is None else f'{gain:+.4f}'} | "
-            f"{'—' if prompt_change is None else f'{prompt_change:+.4f}'} | "
+            f"{retain:.4f} | "
+            f"{'—' if retain_change is None else f'{retain_change:+.4f}'} | "
             f"{values['silence_ratio_mean']:.4f} | {values['clipping_ratio_mean']:.4f} |"
         )
 
@@ -461,9 +474,17 @@ def write_report(path: Path, config: dict, summary: dict) -> None:
             "",
             "- Lower target similarity is better.",
             "- Positive suppression gain means the method is less similar to the target than the paired base audio.",
-            "- Positive prompt-similarity change means greater similarity to the full prompt than the paired base audio.",
-            "- The full prompt contains the target concept in the current two-column dataset, so prompt similarity is "
-            "only a coarse fidelity proxy and partially conflicts with target suppression.",
+            "- The retain prompt is the prompt with the target removed, derived per row by `utils.strip_target`, and "
+            "is the fidelity measure that does not conflict with suppression. It is what `scripts/train.py` optimizes "
+            "when `--retain-weight` is non-zero, and each row's text is in `sample_metrics.csv`.",
+            "- Positive retain-similarity change means the method kept more of the rest of the prompt than the paired "
+            "base audio; a large suppression gain paired with a negative retain change usually means degraded audio "
+            "rather than a removed concept.",
+            "- The removal is lexical, so modifiers of the target survive it (\"muted trumpet with a plunger mute\" "
+            "becomes \"muted with a plunger mute\"). Some target-adjacent meaning therefore remains in the retain "
+            "text, which biases the retain metric slightly upward for methods that suppress less.",
+            "- `prompt_similarity` in `sample_metrics.csv` and `summary.json` scores the full prompt, which still "
+            "contains the target, so it is only a coarse fidelity proxy and partially conflicts with suppression.",
             "- Silence and clipping ratios are sanity checks, not complete perceptual-quality measures.",
             "- Confidence intervals in `summary.json` are clustered by prompt: seeds are averaged first, then prompts "
             "are bootstrapped.",
@@ -523,7 +544,7 @@ def main() -> None:
         "num_prompts": len(dataset),
         "num_seeds": args.num_seeds,
         "first_seed": args.seed,
-        "target_counts": dict(Counter(target for _, target in dataset.rows)),
+        "target_counts": dict(Counter(target for _, target, _ in dataset.rows)),
         "same_dataset_as_training": same_dataset,
         "device": str(device),
         "dtype": str(dtype),
@@ -578,7 +599,7 @@ def main() -> None:
 
         # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
         # evaluating one prompt at a time keeps every saved schedule attributable to one prompt.
-        for sample_id, (prompt, target) in enumerate(dataset.rows):
+        for sample_id, (prompt, target, retain_prompt) in enumerate(dataset.rows):
             for seed_index in range(args.num_seeds):
                 sample_seed = args.seed + seed_index * len(dataset) + sample_id
                 for method_name, steering_model in methods.items():
@@ -608,6 +629,7 @@ def main() -> None:
                         audio_embeds = clap.encode_audio(waveform_for_clap, sampling_rate)
                         target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
                         prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
+                        retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
 
                     waveform = waveform_tensor[0].detach().float().cpu().numpy()
                     signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
@@ -628,9 +650,11 @@ def main() -> None:
                         "method": method_name,
                         "prompt": prompt,
                         "target": target,
+                        "retain_prompt": retain_prompt,
                         "audio_path": audio_relative_path,
                         "target_similarity": target_similarity,
                         "prompt_similarity": prompt_similarity,
+                        "retain_similarity": retain_similarity,
                         **signal,
                         **alpha_stats,
                     }
@@ -652,7 +676,8 @@ def main() -> None:
                     completed += 1
                     print(
                         f"[{completed}/{total_generations}] sample={sample_id} seed={sample_seed} method={method_name} "
-                        f"target_cos={target_similarity:+.4f} prompt_cos={prompt_similarity:+.4f}",
+                        f"target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
+                        f"prompt_cos={prompt_similarity:+.4f}",
                         flush=True,
                     )
 

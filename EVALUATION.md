@@ -81,6 +81,9 @@ only when the named evaluation directory may be removed and recreated.
 For each generated waveform the evaluator records:
 
 - `target_similarity`: CLAP cosine similarity between audio and target; lower is better;
+- `retain_similarity`: CLAP cosine similarity between audio and the retain prompt, i.e. the prompt
+  with the target removed (`utils.strip_target`, also written to the `retain_prompt` column); higher
+  is better, and this is the term `scripts/train.py` optimizes alongside suppression;
 - `prompt_similarity`: CLAP cosine similarity between audio and the full prompt;
 - RMS, peak, near-silence ratio and clipping ratio;
 - alpha mean, standard deviation, minimum and maximum;
@@ -89,13 +92,20 @@ For each generated waveform the evaluator records:
 Paired metrics compare a method with `base` for the same prompt and seed:
 
 ```text
-target suppression gain = target_similarity(base) - target_similarity(method)
+target suppression gain  = target_similarity(base) - target_similarity(method)
+retain similarity change = retain_similarity(method) - retain_similarity(base)
 prompt similarity change = prompt_similarity(method) - prompt_similarity(base)
 ```
 
-A positive suppression gain is desirable. Prompt-similarity change is only a coarse fidelity proxy:
-in the current dataset the full prompt includes the target word `trumpet`, so suppressing the target
-and matching the full prompt are partially conflicting objectives.
+A positive suppression gain is desirable, and the trade-off plot reads it against the retain
+similarity change: a large gain paired with a negative retain change usually means the audio was
+degraded rather than the concept removed.
+
+Prompt-similarity change is only a coarse fidelity proxy: in the current dataset the full prompt
+includes the target word `trumpet`, so suppressing the target and matching the full prompt are
+partially conflicting objectives. The retain prompt exists to remove that conflict, but its
+derivation is lexical, so modifiers of the target survive it (`"muted trumpet with a plunger mute"`
+becomes `"muted with a plunger mute"`) and a little target-adjacent meaning stays behind.
 
 Confidence intervals use prompts as the independent units. Results from multiple seeds are averaged
 within each prompt before bootstrap resampling, avoiding artificially narrow intervals from treating

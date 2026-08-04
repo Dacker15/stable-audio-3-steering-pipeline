@@ -2,9 +2,17 @@ r"""
 Trains a `SteeringPredictor` to suppress a concept in `SteeringMusicLDMPipeline` generations.
 
 Each training step generates a full batch of waveforms with steering enabled, embeds them with the
-CLAP audio tower and *maximizes* the cosine distance to the steering target, so the predictor learns
-a per-timestep `alpha_t` that steers the denoising trajectory away from the target concept even
-though the prompt asks for it.
+CLAP audio tower and scores them against two texts:
+
+* the steering target, whose cosine distance is *maximized*, so the predictor learns a per-timestep
+  `alpha_t` that steers the denoising trajectory away from the target concept even though the prompt
+  asks for it;
+* the retain prompt, i.e. the prompt with the target removed (`utils.strip_target`), whose cosine
+  distance is *minimized*, so everything else the prompt asks for survives the suppression.
+
+The retain term is what separates removing the concept from degrading the audio: silence and noise
+are both far from the target, and only the retain term tells them apart from a faithful rendition of
+the rest of the prompt.
 
 Gradients reach the predictor because the pipeline is called with `output_type="latent"`: the
 `torch.no_grad()` in its post-processing block only stops new grad-tracking ops, it does not detach
@@ -29,8 +37,9 @@ from losses import ClapLoss
 from pipelines import SteeringMusicLDMPipeline, SteeringPredictor
 from utils import PromptTargetDataset, collate_prompt_target
 
-# static light-surface artifacts: chrome and ink from the reference palette, one blue for the single
-# series and a validated 5-step ordinal blue ramp for the per-epoch alpha lines
+# static light-surface artifacts: chrome and ink from the reference palette, the first two
+# categorical slots for the target/retain pair and a validated 5-step ordinal blue ramp for the
+# per-epoch alpha lines
 PALETTE = {
     "surface": "#fcfcfb",
     "ink": "#0b0b0b",
@@ -39,6 +48,7 @@ PALETTE = {
     "grid": "#e1e0d9",
     "axis": "#c3c2b7",
     "series": "#2a78d6",
+    "series_2": "#eb6834",
 }
 ORDINAL_BLUE = ("#86b6ef", "#3987e5", "#256abf", "#184f95", "#0d366b")
 
@@ -82,13 +92,13 @@ def parse_args() -> argparse.Namespace:
     optim.add_argument("--grad-accum-steps", type=int, default=4, help="batches accumulated per optimizer step")
     optim.add_argument("--max-grad-norm", type=float, default=1.0)
     optim.add_argument(
-        "--fidelity-weight",
+        "--retain-weight",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
-            "weight of an auxiliary term pulling the audio towards the full prompt. pure suppression can be solved by"
-            " degrading the audio rather than by removing the target concept from it; raise this if the alpha schedule"
-            " saturates at either end of its range"
+            "weight of the retain term, which pulls the audio towards the prompt with the target removed. pure"
+            " suppression can be solved by degrading the audio rather than by removing the target concept from it,"
+            " and this term is what rules that solution out. 0.0 disables it and optimizes suppression alone"
         ),
     )
 
@@ -114,6 +124,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(f"`--batch-size` has to be at least 1 but is {args.batch_size}")
     if args.grad_accum_steps < 1:
         raise ValueError(f"`--grad-accum-steps` has to be at least 1 but is {args.grad_accum_steps}")
+    if args.retain_weight < 0.0:
+        # a negative weight would push the audio away from the rest of the prompt as well, i.e. ask
+        # for degraded audio outright
+        raise ValueError(f"`--retain-weight` has to be non-negative but is {args.retain_weight}")
     if not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0:
         raise ValueError(
             "`--steering-frac-start` and `--steering-frac-end` have to satisfy"
@@ -166,32 +180,31 @@ def save_figure(fig: plt.Figure, path: Path) -> None:
 
 def plot_loss_curve(history: dict, path: Path) -> None:
     r"""
-    Writes the optimized loss and the CLAP cosine similarity to the target, one point per epoch.
+    Writes the optimized loss and both CLAP cosine similarities, one point per epoch.
 
-    Two stacked panels rather than one plot with two y-scales: the two measures have unrelated
-    ranges, and overlaying them on separate scales would invent a relationship. Per-batch values
-    (`history["iterations"]`) only support the epoch means plotted here; they are not drawn
-    themselves, but stay in `history.json`.
+    Two stacked panels rather than one plot with two y-scales: the loss and the similarities have
+    unrelated ranges, and overlaying them on separate scales would invent a relationship. The two
+    similarities do share a panel, because they share the cosine scale and reading one against the
+    other *is* the suppression/retain trade-off. Per-batch values (`history["iterations"]`) only
+    support the epoch means plotted here; they are not drawn themselves, but stay in `history.json`.
     """
     epochs = history["epochs"]
     epoch_numbers = [record["epoch"] for record in epochs]
 
     fig, (ax_loss, ax_cos) = plt.subplots(2, 1, figsize=(9, 7.5), facecolor=PALETTE["surface"])
 
-    for ax, key, title, ylabel in (
-        (ax_loss, "loss", "Training loss — lower means further from the target concept", "loss"),
-        (ax_cos, "cosine_similarity", "CLAP cosine similarity to the steering target", "cosine similarity"),
-    ):
+    def draw_series(ax: plt.Axes, key: str, color: str, label: str | None = None) -> None:
         values = [record[key] for record in epochs]
         ax.plot(
             epoch_numbers,
             values,
-            color=PALETTE["series"],
+            color=color,
             linewidth=2.0,
             marker="o",
             markersize=8,
             markeredgecolor=PALETTE["surface"],
             markeredgewidth=2.0,
+            label=label,
         )
         # direct-label only the endpoint, so the value is readable without a tooltip
         ax.annotate(
@@ -203,11 +216,27 @@ def plot_loss_curve(history: dict, path: Path) -> None:
             fontsize=9,
             color=PALETTE["ink"],
         )
+
+    draw_series(ax_loss, "loss", PALETTE["series"])
+    draw_series(ax_cos, "target_similarity", PALETTE["series"], "target — suppressed")
+    draw_series(ax_cos, "retain_similarity", PALETTE["series_2"], "retain prompt — preserved")
+
+    for ax, title, ylabel in (
+        (ax_loss, "Training loss — the suppression and retain terms combined", "loss"),
+        (ax_cos, "CLAP cosine similarity, target against retain prompt", "cosine similarity"),
+    ):
         ax.set_xticks(epoch_numbers)
         ax.set_title(title, fontsize=11, loc="left", pad=10)
         ax.set_xlabel("epoch")
         ax.set_ylabel(ylabel)
+        # the default margin is thinner than the markers, which leaves the extreme points clipped
+        # by the axes
+        ax.margins(y=0.15)
         style_axes(ax)
+
+    legend = ax_cos.legend(frameon=False, fontsize=9, loc="best")
+    for text in legend.get_texts():
+        text.set_color(PALETTE["ink_secondary"])
 
     fig.tight_layout()
     save_figure(fig, path)
@@ -297,6 +326,10 @@ def main() -> None:
         collate_fn=collate_prompt_target,
     )
     print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
+    # the retain prompt is derived rather than supplied, so show one: a bad strip is otherwise only
+    # visible in the metrics, several hours in
+    _, example_target, example_retain = dataset.rows[0]
+    print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
 
     # float32 throughout: the gradient reaches `alpha_t` through the scheduler recurrence, the VAE,
     # the vocoder and the CLAP tower, and in half precision that chain returns a gradient whose sign
@@ -337,10 +370,11 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
 
         epoch_losses: list[float] = []
-        epoch_similarities: list[float] = []
+        epoch_target_similarities: list[float] = []
+        epoch_retain_similarities: list[float] = []
         epoch_alpha_records: list[tuple[float, float]] = []
 
-        for batch_index, (prompts, targets) in enumerate(dataloader):
+        for batch_index, (prompts, targets, retains) in enumerate(dataloader):
             step += 1
             # fresh noise every batch, but reproducible across runs
             generator = torch.Generator().manual_seed(args.seed + step)
@@ -373,10 +407,14 @@ def main() -> None:
 
             # `ClapLoss` returns `1 - cosine_similarity`, so negating it maximizes the distance to
             # the target, i.e. suppresses the concept the prompt asks for
-            distance = clap_loss(audio_embeds, targets)
-            loss = -distance
-            if args.fidelity_weight > 0.0:
-                loss = loss + args.fidelity_weight * clap_loss(audio_embeds, prompts)
+            target_distance = clap_loss(audio_embeds, targets)
+            loss = -target_distance
+
+            # the same quantity against the prompt without the target, this time minimized, so the
+            # audio keeps everything the prompt asks for besides the concept being suppressed
+            retain_distance = clap_loss(audio_embeds, retains) if args.retain_weight > 0.0 else None
+            if retain_distance is not None:
+                loss = loss + args.retain_weight * retain_distance
 
             (loss / args.grad_accum_steps).backward()
 
@@ -388,21 +426,31 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
 
             loss_value = float(loss.detach())
-            similarity = 1.0 - float(distance.detach())
+            target_similarity = 1.0 - float(target_distance.detach())
+            # measured even when the term is switched off, since it is the diagnostic that tells
+            # concept removal apart from plain audio degradation
+            with torch.no_grad():
+                retain_similarity = (
+                    1.0 - float(retain_distance.detach())
+                    if retain_distance is not None
+                    else 1.0 - float(clap_loss(audio_embeds.detach(), retains))
+                )
             epoch_losses.append(loss_value)
-            epoch_similarities.append(similarity)
+            epoch_target_similarities.append(target_similarity)
+            epoch_retain_similarities.append(retain_similarity)
             history["iterations"].append(
                 {
                     "step": step,
                     "epoch": epoch,
                     "loss": loss_value,
-                    "cosine_similarity": similarity,
+                    "target_similarity": target_similarity,
+                    "retain_similarity": retain_similarity,
                     "grad_norm": grad_norm,
                 }
             )
             print(
                 f"epoch {epoch}/{args.epochs} batch {batch_index + 1}/{len(dataloader)}"
-                f" loss {loss_value:+.4f} cos {similarity:+.4f}"
+                f" loss {loss_value:+.4f} target_cos {target_similarity:+.4f} retain_cos {retain_similarity:+.4f}"
                 f" grad_norm {'-' if grad_norm is None else f'{grad_norm:.3e}'}",
                 flush=True,
             )
@@ -413,7 +461,8 @@ def main() -> None:
                 "epoch": epoch,
                 "last_step": step,
                 "loss": epoch_loss,
-                "cosine_similarity": sum(epoch_similarities) / len(epoch_similarities),
+                "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
+                "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
                 "alpha_by_timestep": mean_alpha_by_timestep(epoch_alpha_records),
             }
         )
