@@ -4,15 +4,15 @@ Evaluates a trained ``SteeringPredictor`` against the unsteered MusicLDM baselin
 Example smoke test (using a checkpoint produced by ``scripts/train.py``):
 
     uv run python scripts/evaluate.py \
-        --dataset datasets/trumpet_prompts_dataset.csv \
-        --checkpoint outputs/trumpet/steering_predictor_best.pt \
+        --dataset datasets/trumpet_simple_splits/validation.csv \
+        --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
         --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --num-inference-steps 20
 
 Example final run with fixed-alpha controls:
 
     uv run python scripts/evaluate.py \
-        --dataset datasets/trumpet_test.csv \
-        --checkpoint outputs/trumpet/steering_predictor_best.pt \
+        --dataset datasets/trumpet_simple_splits/test.csv \
+        --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
         --output outputs/eval-final --num-seeds 5 \
         --fixed-alphas 0.25 0.5 0.75 1.0
 """
@@ -33,7 +33,7 @@ import torch
 from torch import nn
 
 from losses import ClapLoss
-from pipelines import SteeringMusicLDMPipeline, SteeringPredictor
+from pipelines import STEERING_MODE, SteeringMusicLDMPipeline, SteeringPredictor
 from utils import PromptTargetDataset
 
 
@@ -65,7 +65,7 @@ SAMPLE_FIELDS = [
     "alpha_std",
     "alpha_min",
     "alpha_max",
-    "inverted_guidance_ratio",
+    "retain_dominant_ratio",
 ]
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
 
@@ -94,7 +94,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     data = parser.add_argument_group("data and checkpoint")
-    data.add_argument("--dataset", type=Path, required=True, help="evaluation CSV with prompt and target columns")
+    data.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        help="evaluation CSV with prompt,target and preferably an explicit retain_prompt column",
+    )
     data.add_argument("--checkpoint", type=Path, required=True, help="checkpoint produced by scripts/train.py")
     data.add_argument("--output", type=Path, default=Path("outputs/evaluation"))
     data.add_argument("--max-samples", type=int, default=None, help="evaluate only the first N prompts")
@@ -238,7 +243,7 @@ def alpha_metrics(records: list[tuple[float, float]]) -> dict[str, float | None]
             "alpha_std": None,
             "alpha_min": None,
             "alpha_max": None,
-            "inverted_guidance_ratio": None,
+            "retain_dominant_ratio": None,
         }
     values = np.asarray([alpha for _, alpha in records], dtype=np.float64)
     return {
@@ -246,7 +251,7 @@ def alpha_metrics(records: list[tuple[float, float]]) -> dict[str, float | None]
         "alpha_std": float(values.std()),
         "alpha_min": float(values.min()),
         "alpha_max": float(values.max()),
-        "inverted_guidance_ratio": float(np.mean(values > 0.5)),
+        "retain_dominant_ratio": float(np.mean(values > 0.5)),
     }
 
 
@@ -342,8 +347,8 @@ def summarize(
         alpha_values = [row["alpha_mean"] for row in method_rows if row["alpha_mean"] is not None]
         if alpha_values:
             method_summary["alpha_mean"] = float(np.mean(alpha_values))
-            method_summary["inverted_guidance_ratio_mean"] = float(
-                np.mean([row["inverted_guidance_ratio"] for row in method_rows])
+            method_summary["retain_dominant_ratio_mean"] = float(
+                np.mean([row["retain_dominant_ratio"] for row in method_rows])
             )
         summary["methods"][method] = method_summary
     return summary
@@ -412,7 +417,7 @@ def plot_alpha_schedules(alpha_runs: list[dict], path: Path) -> None:
         timesteps = sorted(by_timestep, reverse=True)
         values = [float(np.mean(by_timestep[timestep])) for timestep in timesteps]
         ax.plot(timesteps, values, label=method, color=PLOT_COLORS[index % len(PLOT_COLORS)], linewidth=2)
-    ax.axhline(0.5, color="#999999", linewidth=1, linestyle="--", label="guidance inversion threshold")
+    ax.axhline(0.5, color="#999999", linewidth=1, linestyle="--", label="full/retain midpoint")
     ax.invert_xaxis()
     ax.set_xlabel("Denoising timestep (noisy to clean)")
     ax.set_ylabel("Mean alpha")
@@ -474,15 +479,15 @@ def write_report(path: Path, config: dict, summary: dict) -> None:
             "",
             "- Lower target similarity is better.",
             "- Positive suppression gain means the method is less similar to the target than the paired base audio.",
-            "- The retain prompt is the prompt with the target removed, derived per row by `utils.strip_target`, and "
-            "is the fidelity measure that does not conflict with suppression. It is what `scripts/train.py` optimizes "
-            "when `--retain-weight` is non-zero, and each row's text is in `sample_metrics.csv`.",
+            "- The retain prompt comes from the dataset when an explicit `retain_prompt` column is present; legacy "
+            "two-column datasets fall back to `utils.strip_target`. It is the fidelity measure optimized by "
+            "`scripts/train.py` when `--retain-weight` is non-zero, and each row's text is in `sample_metrics.csv`.",
             "- Positive retain-similarity change means the method kept more of the rest of the prompt than the paired "
             "base audio; a large suppression gain paired with a negative retain change usually means degraded audio "
             "rather than a removed concept.",
-            "- The removal is lexical, so modifiers of the target survive it (\"muted trumpet with a plunger mute\" "
-            "becomes \"muted with a plunger mute\"). Some target-adjacent meaning therefore remains in the retain "
-            "text, which biases the retain metric slightly upward for methods that suppress less.",
+            "- Only the legacy fallback removal is lexical: modifiers of the target can survive it "
+            "(\"muted trumpet with a plunger mute\" becomes \"muted with a plunger mute\"). Explicit retain "
+            "prompts avoid this wording artifact.",
             "- `prompt_similarity` in `sample_metrics.csv` and `summary.json` scores the full prompt, which still "
             "contains the target, so it is only a coarse fidelity proxy and partially conflicts with suppression.",
             "- Silence and clipping ratios are sanity checks, not complete perceptual-quality measures.",
@@ -514,6 +519,16 @@ def main() -> None:
     missing = required_keys - set(checkpoint)
     if missing:
         raise ValueError(f"checkpoint {args.checkpoint} is missing keys {sorted(missing)}")
+    if "steering_mode" not in checkpoint:
+        raise ValueError(
+            f"checkpoint {args.checkpoint} predates target-specific full-to-retain steering. Its alpha values used"
+            " the incompatible global-CFG formula, so a new checkpoint must be trained."
+        )
+    if checkpoint["steering_mode"] != STEERING_MODE:
+        raise ValueError(
+            f"checkpoint {args.checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but this evaluator"
+            f" requires {STEERING_MODE!r}"
+        )
     checkpoint_args = checkpoint.get("args", {})
     generation_config = resolve_generation_config(args, checkpoint_args)
     predictor_config = checkpoint["config"]
@@ -556,6 +571,7 @@ def main() -> None:
         "generation": generation_config,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "checkpoint_training_loss": checkpoint.get("loss"),
+        "steering_mode": checkpoint["steering_mode"],
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -608,6 +624,7 @@ def main() -> None:
                     with torch.inference_mode():
                         output = pipe(
                             prompt=prompt,
+                            retain_prompt=retain_prompt,
                             steering_target=target,
                             steering_model=steering_model,
                             steering_frac_start=generation_config["steering_frac_start"],
