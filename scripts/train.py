@@ -60,18 +60,39 @@ PALETTE = {
 ORDINAL_BLUE = ("#86b6ef", "#3987e5", "#256abf", "#184f95", "#0d366b")
 
 
-def mean_alpha_by_timestep(records: list[tuple[float, float]]) -> list[tuple[float, float]]:
+def steered_step_indices(num_inference_steps: int, steering_frac_start: float, steering_frac_end: float) -> list[int]:
+    r"""
+    Returns the 0-based denoising-loop step indices where steering is active, mirroring the exact
+    condition evaluated in `SteeringMusicLDMPipeline.__call__`.
+    """
+    return [
+        step
+        for step in range(num_inference_steps)
+        if steering_frac_start <= step / num_inference_steps < steering_frac_end
+    ]
+
+
+def mean_alpha_by_step(
+    records: list[tuple[float, float]],
+    num_inference_steps: int,
+    steering_frac_start: float,
+    steering_frac_end: float,
+) -> list[tuple[int, float]]:
     r"""
     Returns:
-        `list[tuple[float, float]]`: `(timestep, mean_alpha)` pairs, ordered from the noisiest to
-        the cleanest timestep, i.e. in denoising order.
+        `list[tuple[int, float]]`: `(step, mean_alpha)` pairs, one per denoising-loop step inside the
+        steering window, ordered from `steering_frac_start` to `steering_frac_end`.
     """
     totals: dict[float, float] = defaultdict(float)
     counts: dict[float, int] = defaultdict(int)
     for timestep, alpha in records:
         totals[timestep] += alpha
         counts[timestep] += 1
-    return [(timestep, totals[timestep] / counts[timestep]) for timestep in sorted(totals, reverse=True)]
+    # raw timesteps decrease as the denoising loop advances, so sorting them from high to low
+    # recovers loop order and lines up positionally with `steered_step_indices`
+    means_in_loop_order = [totals[timestep] / counts[timestep] for timestep in sorted(totals, reverse=True)]
+    steps = steered_step_indices(num_inference_steps, steering_frac_start, steering_frac_end)
+    return list(zip(steps, means_in_loop_order, strict=True))
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,10 +169,8 @@ def parse_args() -> argparse.Namespace:
             " the predictor would receive no gradient."
         )
 
-    num_steered_steps = sum(
-        1
-        for step in range(args.num_inference_steps)
-        if args.steering_frac_start <= step / args.num_inference_steps < args.steering_frac_end
+    num_steered_steps = len(
+        steered_step_indices(args.num_inference_steps, args.steering_frac_start, args.steering_frac_end)
     )
     if num_steered_steps == 0:
         raise ValueError(
@@ -187,42 +206,57 @@ def save_figure(fig: plt.Figure, path: Path) -> None:
 
 def plot_loss_curve(history: dict, path: Path) -> None:
     r"""
-    Writes the optimized loss and both CLAP cosine similarities, one point per epoch.
+    Writes the optimized loss and both CLAP cosine similarities, one point per training iteration.
 
     Two stacked panels rather than one plot with two y-scales: the loss and the similarities have
     unrelated ranges, and overlaying them on separate scales would invent a relationship. The two
     similarities do share a panel, because they share the cosine scale and reading one against the
-    other *is* the suppression/retain trade-off. Per-batch values (`history["iterations"]`) only
-    support the epoch means plotted here; they are not drawn themselves, but stay in `history.json`.
+    other *is* the suppression/retain trade-off. Plotting `history["iterations"]` rather than the
+    epoch means in `history["epochs"]` keeps per-step noise and outliers visible instead of smoothing
+    them away. Dashed vertical lines mark where each epoch ends, using `history["epochs"]`'
+    `last_step`.
     """
-    epochs = history["epochs"]
-    epoch_numbers = [record["epoch"] for record in epochs]
+    iterations = history["iterations"]
+    steps = [record["step"] for record in iterations]
+    # the last epoch's boundary coincides with the plot's right edge, so it would only draw a
+    # line on top of the axis spine
+    epoch_boundaries = [record["last_step"] for record in history["epochs"][:-1]]
 
     fig, (ax_loss, ax_cos) = plt.subplots(2, 1, figsize=(9, 7.5), facecolor=PALETTE["surface"])
 
+    def draw_epoch_boundaries(ax: plt.Axes, label: bool) -> None:
+        for epoch_record, boundary in zip(history["epochs"][:-1], epoch_boundaries, strict=True):
+            ax.axvline(boundary, color=PALETTE["muted"], linewidth=0.8, linestyle="--", zorder=1)
+            if label:
+                ax.annotate(
+                    f"epoch {epoch_record['epoch']}",
+                    (boundary, 1.0),
+                    xycoords=ax.get_xaxis_transform(),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                    color=PALETTE["muted"],
+                    ha="left",
+                )
+
     def draw_series(ax: plt.Axes, key: str, color: str, label: str | None = None) -> None:
-        values = [record[key] for record in epochs]
-        ax.plot(
-            epoch_numbers,
-            values,
-            color=color,
-            linewidth=2.0,
-            marker="o",
-            markersize=8,
-            markeredgecolor=PALETTE["surface"],
-            markeredgewidth=2.0,
-            label=label,
-        )
+        values = [record[key] for record in iterations]
+        ax.plot(steps, values, color=color, linewidth=1.2, label=label)
         # direct-label only the endpoint, so the value is readable without a tooltip
         ax.annotate(
             f"{values[-1]:.3f}",
-            (epoch_numbers[-1], values[-1]),
+            (steps[-1], values[-1]),
             textcoords="offset points",
             xytext=(8, 0),
             va="center",
             fontsize=9,
             color=PALETTE["ink"],
         )
+
+    # labels only on the top panel, so the two panels' epoch numbers don't repeat right on top of
+    # each other
+    draw_epoch_boundaries(ax_loss, label=True)
+    draw_epoch_boundaries(ax_cos, label=False)
 
     draw_series(ax_loss, "loss", PALETTE["series"])
     draw_series(ax_cos, "target_similarity", PALETTE["series"], "target — suppressed")
@@ -232,12 +266,9 @@ def plot_loss_curve(history: dict, path: Path) -> None:
         (ax_loss, "Training loss — the suppression and retain terms combined", "loss"),
         (ax_cos, "CLAP cosine similarity, target against retain prompt", "cosine similarity"),
     ):
-        ax.set_xticks(epoch_numbers)
         ax.set_title(title, fontsize=11, loc="left", pad=10)
-        ax.set_xlabel("epoch")
+        ax.set_xlabel("training step")
         ax.set_ylabel(ylabel)
-        # the default margin is thinner than the markers, which leaves the extreme points clipped
-        # by the axes
         ax.margins(y=0.15)
         style_axes(ax)
 
@@ -251,16 +282,23 @@ def plot_loss_curve(history: dict, path: Path) -> None:
 
 def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: float) -> None:
     r"""
-    Writes the mean predicted `alpha_t` against the denoising timestep, one line per epoch.
+    Writes the mean predicted `alpha_t` against the denoising-loop step, one line per epoch.
 
     This is the load-bearing diagnostic: it shows whether the predictor learned a schedule that
     varies along the trajectory or collapsed to a constant.
+
+    The x-axis is the 0-based step index inside the steering window: `steering_frac_start` maps to
+    the lowest step plotted and `steering_frac_end` to the highest, matching the condition evaluated
+    in `SteeringMusicLDMPipeline.__call__`. Step index rises from noisy to clean as the loop advances,
+    so, unlike a raw-timestep axis, it needs no inversion to read left to right.
 
     Epochs are an ordered quantity, so the lines use a single-hue ordinal ramp rather than
     categorical hues. At most `len(ORDINAL_BLUE)` epochs are drawn, evenly spaced and always
     including the first and the last; `history.json` carries every epoch.
     """
     epochs = history["epochs"]
+    args = history["args"]
+    steps = steered_step_indices(args["num_inference_steps"], args["steering_frac_start"], args["steering_frac_end"])
 
     if len(epochs) <= len(ORDINAL_BLUE):
         selected = epochs
@@ -294,15 +332,14 @@ def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: 
         colors = [ORDINAL_BLUE[round(index * step_size)] for index in range(len(selected))]
 
     for record, color in zip(selected, colors, strict=True):
-        timesteps = [timestep for timestep, _ in record["alpha_by_timestep"]]
-        alphas = [alpha for _, alpha in record["alpha_by_timestep"]]
-        ax.plot(timesteps, alphas, color=color, linewidth=2.0, label=f"epoch {record['epoch']}", zorder=2)
+        step_values = [step for step, _ in record["alpha_by_step"]]
+        alphas = [alpha for _, alpha in record["alpha_by_step"]]
+        ax.plot(step_values, alphas, color=color, linewidth=2.0, label=f"epoch {record['epoch']}", zorder=2)
 
     ax.set_title("Predicted steering strength across the denoising trajectory", fontsize=11, loc="left", pad=10)
-    ax.set_xlabel("denoising timestep (noisy → clean)")
+    ax.set_xlabel("denoising step (noisy → clean)")
     ax.set_ylabel("mean α")
-    # denoising runs from high to low timesteps, so read the trajectory left to right
-    ax.invert_xaxis()
+    ax.set_xlim(steps[0], steps[-1])
     margin = 0.04 * (alpha_max - alpha_min)
     ax.set_ylim(alpha_min - margin, alpha_max + margin)
     style_axes(ax)
@@ -470,7 +507,9 @@ def main() -> None:
                 "loss": epoch_loss,
                 "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
                 "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
-                "alpha_by_timestep": mean_alpha_by_timestep(epoch_alpha_records),
+                "alpha_by_step": mean_alpha_by_step(
+                    epoch_alpha_records, args.num_inference_steps, args.steering_frac_start, args.steering_frac_end
+                ),
             }
         )
         print(f"epoch {epoch}/{args.epochs} mean loss {epoch_loss:+.4f}")
