@@ -1,514 +1,563 @@
-r"""
-Trains a `SteeringPredictor` to suppress a concept in `SteeringMusicLDMPipeline` generations.
+"""Train target-specific ACE-Step 1.5 steering in external CLAP space.
 
-Each training step generates a full batch of waveforms with steering enabled, embeds them with the
-CLAP audio tower and scores them against two texts:
-
-* the steering target, whose cosine distance is *maximized*, so the predictor learns a per-timestep
-  `alpha_t` that moves the denoising trajectory from full-prompt guidance towards retain-prompt
-  guidance;
-* the retain prompt supplied by the dataset (or derived with `utils.strip_target` for legacy
-  two-column CSVs), whose cosine distance is *minimized*, so everything else the prompt asks for
-  survives the suppression.
-
-The retain term is what separates removing the concept from degrading the audio: silence and noise
-are both far from the target, and only the retain term tells them apart from a faithful rendition of
-the rest of the prompt.
-
-Gradients reach the predictor because the pipeline is called with `output_type="latent"`: the
-`torch.no_grad()` in its post-processing block only stops new grad-tracking ops, it does not detach
-the latents, which are returned before any decoding happens. The UNet itself runs under `no_grad`,
-so the gradient flows to each `alpha_t` through the scheduler's linear recurrence only. That is a
-first-order approximation of the true gradient and is what keeps the unrolled trajectory affordable.
-
-Example:
-    uv run python scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv --batch-size 2 \
-        --output outputs/trumpet-target-specific --epochs 5 --steering-frac-start 0.1 --steering-frac-end 0.8
+The ACE-Step DiT, Qwen encoder, VAE and CLAP towers are frozen.  The default
+``steering_only`` gradient evaluates every DiT branch under ``no_grad`` and
+backpropagates through the predictor, alpha interpolation, APG/Euler updates,
+the differentiable VAE decode and the CLAP audio tower.  It is a documented
+surrogate: it omits the DiT Jacobian with respect to the evolving latent.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
+
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringMusicLDMPipeline, SteeringPredictor
-from utils import PromptTargetDataset, collate_prompt_target
-
-# static light-surface artifacts: chrome and ink from the reference palette, the first two
-# categorical slots for the target/retain pair and a validated 5-step ordinal blue ramp for the
-# per-epoch alpha lines
-PALETTE = {
-    "surface": "#fcfcfb",
-    "ink": "#0b0b0b",
-    "ink_secondary": "#52514e",
-    "muted": "#898781",
-    "grid": "#e1e0d9",
-    "axis": "#c3c2b7",
-    "series": "#2a78d6",
-    "series_2": "#eb6834",
-}
-ORDINAL_BLUE = ("#86b6ef", "#3987e5", "#256abf", "#184f95", "#0d366b")
-
-
-def mean_alpha_by_timestep(records: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    r"""
-    Returns:
-        `list[tuple[float, float]]`: `(timestep, mean_alpha)` pairs, ordered from the noisiest to
-        the cleanest timestep, i.e. in denoising order.
-    """
-    totals: dict[float, float] = defaultdict(float)
-    counts: dict[float, int] = defaultdict(int)
-    for timestep, alpha in records:
-        totals[timestep] += alpha
-        counts[timestep] += 1
-    return [(timestep, totals[timestep] / counts[timestep]) for timestep in sorted(totals, reverse=True)]
+from losses import DEFAULT_CLAP_MAX_LENGTH_S, DEFAULT_CLAP_MODEL_ID, DEFAULT_CLAP_REVISION, ClapLoss
+from pipelines import (
+    ACE_STEP_COMPONENTS_ID,
+    ACE_STEP_COMPONENTS_REVISION,
+    ACE_STEP_LATENT_CHANNELS,
+    ACE_STEP_MODEL_ID,
+    ACE_STEP_MODEL_REVISION,
+    ACE_STEP_SAMPLE_RATE,
+    GRADIENT_MODE,
+    STEERING_MODE,
+    SteeringAceStepPipeline,
+    SteeringPredictor,
+)
+from utils import (
+    PromptTargetDataset,
+    build_checkpoint,
+    collate_prompt_target,
+    load_checkpoint,
+    restore_training_state,
+    save_checkpoint,
+    save_waveform,
+)
 
 
-def parse_args() -> argparse.Namespace:
+def _add_runtime_switches(parser: argparse.ArgumentParser) -> None:
+    dit = parser.add_mutually_exclusive_group()
+    dit.add_argument("--sequential-dit", dest="sequential_dit", action="store_true")
+    dit.add_argument("--batched-dit", dest="sequential_dit", action="store_false")
+    offload = parser.add_mutually_exclusive_group()
+    offload.add_argument(
+        "--offload-dit-after-generation", dest="offload_dit_after_generation", action="store_true"
+    )
+    offload.add_argument("--keep-dit-on-device", dest="offload_dit_after_generation", action="store_false")
+    parser.set_defaults(sequential_dit=True, offload_dit_after_generation=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a SteeringPredictor to suppress a concept in MusicLDM generations.",
+        description="Train the ACE-Step target-specific steering predictor.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    data = parser.add_argument_group("data/output")
+    data.add_argument("--train-csv", type=Path, required=True)
+    data.add_argument("--output-dir", type=Path, required=True)
+    data.add_argument("--max-samples", type=int)
+    data.add_argument("--batch-size", type=int, default=1)
+    data.add_argument("--num-workers", type=int, default=0)
+    data.add_argument("--resume", type=Path, help="v2 ACE-Step checkpoint to resume")
 
-    data = parser.add_argument_group("data and output")
-    data.add_argument(
-        "--dataset",
-        type=Path,
-        required=True,
-        help="CSV with prompt,target and preferably an explicit retain_prompt column",
-    )
-    data.add_argument("--output", type=Path, default=Path("outputs"), help="folder for weights and plots")
-    data.add_argument("--batch-size", type=int, default=1, help="prompts generated per forward pass")
-    data.add_argument("--max-samples", type=int, default=None, help="use only the first N rows of the dataset")
+    model = parser.add_argument_group("models")
+    model.add_argument("--model-id", default=ACE_STEP_MODEL_ID)
+    model.add_argument("--model-revision", default=ACE_STEP_MODEL_REVISION)
+    model.add_argument("--components-id", default=ACE_STEP_COMPONENTS_ID)
+    model.add_argument("--components-revision", default=ACE_STEP_COMPONENTS_REVISION)
+    model.add_argument("--clap-model-id", default=DEFAULT_CLAP_MODEL_ID)
+    model.add_argument("--clap-revision", default=DEFAULT_CLAP_REVISION)
 
-    steering = parser.add_argument_group("steering")
-    steering.add_argument("--steering-frac-start", type=float, default=0.3, help="fraction of the loop steering starts")
-    steering.add_argument("--steering-frac-end", type=float, default=0.8, help="fraction of the loop steering ends")
-    steering.add_argument("--alpha-min", type=float, default=0.0, help="lower bound of the predicted alpha_t")
-    steering.add_argument("--alpha-max", type=float, default=1.0, help="upper bound of the predicted alpha_t")
-    steering.add_argument(
-        "--alpha-init",
+    generation = parser.add_argument_group("ACE-Step generation")
+    generation.add_argument("--num-inference-steps", type=int, default=50)
+    generation.add_argument(
+        "--audio-length-in-s",
         type=float,
-        default=0.15,
-        help="initial alpha_t: 0 follows the full prompt and 1 follows the retain prompt",
+        default=DEFAULT_CLAP_MAX_LENGTH_S,
+        help="clip duration; capped at the frozen CLAP tower's complete input window",
     )
+    generation.add_argument("--guidance-scale", type=float, default=7.0)
+    generation.add_argument("--guidance-mode", choices=("apg",), default="apg")
+    generation.add_argument("--shift", type=float, default=1.0)
+    generation.add_argument("--steering-frac-start", type=float, default=0.3)
+    generation.add_argument("--steering-frac-end", type=float, default=0.8)
+    generation.add_argument("--thinking", action="store_true", help="unsupported invariant guard")
+    generation.add_argument("--dcw-enabled", action="store_true", help="unsupported invariant guard")
+
+    predictor = parser.add_argument_group("predictor")
+    predictor.add_argument("--alpha-min", type=float, default=0.0)
+    predictor.add_argument("--alpha-max", type=float, default=1.0)
+    predictor.add_argument("--alpha-init", type=float, default=0.15)
+    predictor.add_argument("--predictor-channels", type=int, nargs="+", default=(64, 128, 256))
+    predictor.add_argument("--predictor-layers-per-block", type=int, default=2)
+    predictor.add_argument("--predictor-cond-dim", type=int, default=256)
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument("--epochs", type=int, default=5)
     optim.add_argument("--lr", type=float, default=1e-4)
     optim.add_argument("--weight-decay", type=float, default=1e-2)
-    optim.add_argument("--grad-accum-steps", type=int, default=4, help="batches accumulated per optimizer step")
+    optim.add_argument("--retain-weight", type=float, default=1.0)
+    optim.add_argument("--grad-accum-steps", type=int, default=1)
     optim.add_argument("--max-grad-norm", type=float, default=1.0)
-    optim.add_argument(
-        "--retain-weight",
-        type=float,
-        default=1.0,
-        help=(
-            "weight of the retain term, which pulls the audio towards the prompt with the target removed. pure"
-            " suppression can be solved by degrading the audio rather than by removing the target concept from it,"
-            " and this term is what rules that solution out. 0.0 disables it and optimizes suppression alone"
-        ),
-    )
-
-    generation = parser.add_argument_group("generation")
-    generation.add_argument("--num-inference-steps", type=int, default=200, help="denoising steps per generation")
-    generation.add_argument(
-        "--audio-length-in-s",
-        type=float,
-        default=10.0,
-        help=(
-            "the default maps exactly onto the 10s window of CLAP's audio tower, so the whole clip is"
-            " scored and nothing is generated that the loss cannot see"
-        ),
-    )
-    generation.add_argument("--guidance-scale", type=float, default=2.0, help="must exceed 1.0 to enable steering")
 
     runtime = parser.add_argument_group("runtime")
+    runtime.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
+    runtime.add_argument("--dtype", default="float32", choices=("float32",))
     runtime.add_argument("--seed", type=int, default=42)
-
-    args = parser.parse_args()
-
-    if args.batch_size < 1:
-        raise ValueError(f"`--batch-size` has to be at least 1 but is {args.batch_size}")
-    if args.grad_accum_steps < 1:
-        raise ValueError(f"`--grad-accum-steps` has to be at least 1 but is {args.grad_accum_steps}")
-    if args.retain_weight < 0.0:
-        # a negative weight would push the audio away from the rest of the prompt as well, i.e. ask
-        # for degraded audio outright
-        raise ValueError(f"`--retain-weight` has to be non-negative but is {args.retain_weight}")
-    if args.alpha_min >= args.alpha_max:
-        raise ValueError(
-            f"`--alpha-min` has to be smaller than `--alpha-max` but got {args.alpha_min} >= {args.alpha_max}"
-        )
-    if not args.alpha_min < args.alpha_init < args.alpha_max:
-        raise ValueError(
-            f"`--alpha-init` has to lie strictly inside ({args.alpha_min}, {args.alpha_max}) but is"
-            f" {args.alpha_init}"
-        )
-    if not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0:
-        raise ValueError(
-            "`--steering-frac-start` and `--steering-frac-end` have to satisfy"
-            f" `0.0 <= start < end <= 1.0` but are {args.steering_frac_start} and {args.steering_frac_end}"
-        )
-    if args.guidance_scale <= 1.0:
-        # the pipeline only calls the steering model inside its classifier free guidance branch
-        raise ValueError(
-            f"`--guidance-scale` has to be greater than 1.0 for steering to be applied but is {args.guidance_scale}."
-            " With a lower value the pipeline skips classifier free guidance and never calls the steering model, so"
-            " the predictor would receive no gradient."
-        )
-
-    num_steered_steps = sum(
-        1
-        for step in range(args.num_inference_steps)
-        if args.steering_frac_start <= step / args.num_inference_steps < args.steering_frac_end
+    runtime.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="force one sample/epoch, two flow steps, and at most two seconds",
     )
-    if num_steered_steps == 0:
-        raise ValueError(
-            f"The steering window [{args.steering_frac_start}, {args.steering_frac_end}) contains no step of the"
-            f" {args.num_inference_steps} denoising steps, so the predictor would receive no gradient. Widen the"
-            " window or raise `--num-inference-steps`."
-        )
-    args.num_steered_steps = num_steered_steps
+    _add_runtime_switches(parser)
+    args = parser.parse_args(argv)
 
+    exact_artifacts = {
+        "model_id": ACE_STEP_MODEL_ID,
+        "model_revision": ACE_STEP_MODEL_REVISION,
+        "components_id": ACE_STEP_COMPONENTS_ID,
+        "components_revision": ACE_STEP_COMPONENTS_REVISION,
+        "clap_model_id": DEFAULT_CLAP_MODEL_ID,
+        "clap_revision": DEFAULT_CLAP_REVISION,
+    }
+    for name, expected in exact_artifacts.items():
+        if getattr(args, name) != expected:
+            parser.error(
+                f"--{name.replace('_', '-')} is pinned by this experiment; expected {expected!r}"
+            )
+
+    if args.thinking or args.dcw_enabled:
+        parser.error("this training path requires thinking=False and dcw_enabled=False")
+    for name in ("batch_size", "num_workers", "epochs", "grad_accum_steps", "num_inference_steps"):
+        value = getattr(args, name)
+        minimum = 0 if name == "num_workers" else 1
+        if value < minimum:
+            parser.error(f"--{name.replace('_', '-')} must be at least {minimum}")
+    if (
+        not math.isfinite(args.audio_length_in_s)
+        or not math.isfinite(args.shift)
+        or args.audio_length_in_s <= 0
+        or args.audio_length_in_s > DEFAULT_CLAP_MAX_LENGTH_S
+        or args.shift <= 0
+    ):
+        parser.error(
+            "--audio-length-in-s must be in (0, 10] for the differentiable CLAP path "
+            "and --shift must be positive"
+        )
+    if not math.isfinite(args.guidance_scale) or args.guidance_scale < 1:
+        parser.error("--guidance-scale must be finite and at least 1")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("--lr must be finite and positive")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("--weight-decay must be finite and non-negative")
+    if (
+        not math.isfinite(args.retain_weight)
+        or not math.isfinite(args.max_grad_norm)
+        or args.retain_weight < 0
+        or args.max_grad_norm <= 0
+    ):
+        parser.error("--retain-weight must be finite/non-negative and --max-grad-norm finite/positive")
+    if not 0.0 <= args.alpha_min < args.alpha_init < args.alpha_max <= 1.0:
+        parser.error("alpha bounds must satisfy 0 <= min < init < max <= 1")
+    if not 0 <= args.steering_frac_start < args.steering_frac_end <= 1:
+        parser.error("steering fractions must satisfy 0 <= start < end <= 1")
+
+    if args.smoke_test:
+        args.max_samples = 1
+        args.batch_size = 1
+        args.epochs = 1
+        args.grad_accum_steps = 1
+        args.num_inference_steps = min(args.num_inference_steps, 2)
+        args.audio_length_in_s = min(args.audio_length_in_s, 2.0)
+
+    steered_steps = sum(
+        args.steering_frac_start <= index / args.num_inference_steps < args.steering_frac_end
+        for index in range(args.num_inference_steps)
+    )
+    if steered_steps == 0:
+        parser.error("the steering window contains no flow step")
+    args.num_steered_steps = steered_steps
     return args
 
 
-def style_axes(ax: plt.Axes) -> None:
-    r"""Applies the recessive chrome shared by every plot: hairline solid grid and muted axes."""
-    ax.set_facecolor(PALETTE["surface"])
-    ax.grid(True, color=PALETTE["grid"], linewidth=0.8, linestyle="-")
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(PALETTE["axis"])
-        ax.spines[side].set_linewidth(0.8)
-    ax.tick_params(colors=PALETTE["muted"], labelsize=9, length=0)
-    ax.xaxis.label.set_color(PALETTE["ink_secondary"])
-    ax.yaxis.label.set_color(PALETTE["ink_secondary"])
-    ax.title.set_color(PALETTE["ink"])
+def _jsonable_args(args: argparse.Namespace) -> dict[str, Any]:
+    return json.loads(json.dumps(vars(args), default=str))
 
 
-def save_figure(fig: plt.Figure, path: Path) -> None:
-    fig.savefig(path, dpi=150, facecolor=PALETTE["surface"], bbox_inches="tight")
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested but CUDA is unavailable")
+    return torch.device(requested)
+
+
+def _mean_alpha(records: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    values: dict[float, list[float]] = defaultdict(list)
+    for timestep, alpha in records:
+        values[round(float(timestep), 8)].append(float(alpha))
+    return [(timestep, float(np.mean(values[timestep]))) for timestep in sorted(values, reverse=True)]
+
+
+def _plot_history(history: dict[str, Any], output_dir: Path) -> None:
+    epochs = history.get("epochs", [])
+    if not epochs:
+        return
+    x = [item["epoch"] for item in epochs]
+    fig, axes = plt.subplots(2, 1, figsize=(9, 7), constrained_layout=True)
+    axes[0].plot(x, [item["loss"] for item in epochs], marker="o", label="objective")
+    axes[0].set(xlabel="epoch", ylabel="loss", title="ACE-Step steering training loss")
+    axes[0].grid(alpha=0.25)
+    axes[1].plot(x, [item["target_similarity"] for item in epochs], marker="o", label="target")
+    axes[1].plot(x, [item["retain_similarity"] for item in epochs], marker="o", label="retain")
+    axes[1].set(xlabel="epoch", ylabel="CLAP cosine", title="Suppression / preservation trade-off")
+    axes[1].legend()
+    axes[1].grid(alpha=0.25)
+    fig.savefig(output_dir / "loss_curves.png", dpi=150)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
+    for item in epochs:
+        schedule = item["alpha_by_timestep"]
+        ax.plot([point[0] for point in schedule], [point[1] for point in schedule], label=f"epoch {item['epoch']}")
+    ax.invert_xaxis()
+    ax.set(xlabel="flow timestep (noise to audio)", ylabel="mean alpha", title="Learned alpha schedule")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.savefig(output_dir / "alpha_schedule.png", dpi=150)
     plt.close(fig)
 
 
-def plot_loss_curve(history: dict, path: Path) -> None:
-    r"""
-    Writes the optimized loss and both CLAP cosine similarities, one point per epoch.
-
-    Two stacked panels rather than one plot with two y-scales: the loss and the similarities have
-    unrelated ranges, and overlaying them on separate scales would invent a relationship. The two
-    similarities do share a panel, because they share the cosine scale and reading one against the
-    other *is* the suppression/retain trade-off. Per-batch values (`history["iterations"]`) only
-    support the epoch means plotted here; they are not drawn themselves, but stay in `history.json`.
-    """
-    epochs = history["epochs"]
-    epoch_numbers = [record["epoch"] for record in epochs]
-
-    fig, (ax_loss, ax_cos) = plt.subplots(2, 1, figsize=(9, 7.5), facecolor=PALETTE["surface"])
-
-    def draw_series(ax: plt.Axes, key: str, color: str, label: str | None = None) -> None:
-        values = [record[key] for record in epochs]
-        ax.plot(
-            epoch_numbers,
-            values,
-            color=color,
-            linewidth=2.0,
-            marker="o",
-            markersize=8,
-            markeredgecolor=PALETTE["surface"],
-            markeredgewidth=2.0,
-            label=label,
-        )
-        # direct-label only the endpoint, so the value is readable without a tooltip
-        ax.annotate(
-            f"{values[-1]:.3f}",
-            (epoch_numbers[-1], values[-1]),
-            textcoords="offset points",
-            xytext=(8, 0),
-            va="center",
-            fontsize=9,
-            color=PALETTE["ink"],
-        )
-
-    draw_series(ax_loss, "loss", PALETTE["series"])
-    draw_series(ax_cos, "target_similarity", PALETTE["series"], "target — suppressed")
-    draw_series(ax_cos, "retain_similarity", PALETTE["series_2"], "retain prompt — preserved")
-
-    for ax, title, ylabel in (
-        (ax_loss, "Training loss — the suppression and retain terms combined", "loss"),
-        (ax_cos, "CLAP cosine similarity, target against retain prompt", "cosine similarity"),
-    ):
-        ax.set_xticks(epoch_numbers)
-        ax.set_title(title, fontsize=11, loc="left", pad=10)
-        ax.set_xlabel("epoch")
-        ax.set_ylabel(ylabel)
-        # the default margin is thinner than the markers, which leaves the extreme points clipped
-        # by the axes
-        ax.margins(y=0.15)
-        style_axes(ax)
-
-    legend = ax_cos.legend(frameon=False, fontsize=9, loc="best")
-    for text in legend.get_texts():
-        text.set_color(PALETTE["ink_secondary"])
-
-    fig.tight_layout()
-    save_figure(fig, path)
+def _assert_finite(name: str, tensor: torch.Tensor) -> None:
+    if not torch.isfinite(tensor).all():
+        raise FloatingPointError(f"non-finite values detected in {name}; FP32 is required")
 
 
-def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: float) -> None:
-    r"""
-    Writes the mean predicted `alpha_t` against the denoising timestep, one line per epoch.
+def _move_clap(clap: ClapLoss, device: torch.device) -> None:
+    if next(clap.parameters()).device != device:
+        clap.to(device=device, dtype=torch.float32)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    This is the load-bearing diagnostic: it shows whether the predictor learned a schedule that
-    varies along the trajectory or collapsed to a constant.
 
-    Epochs are an ordered quantity, so the lines use a single-hue ordinal ramp rather than
-    categorical hues. At most `len(ORDINAL_BLUE)` epochs are drawn, evenly spaced and always
-    including the first and the last; `history.json` carries every epoch.
-    """
-    epochs = history["epochs"]
+_RESUME_INVARIANTS = (
+    "train_csv",
+    "max_samples",
+    "batch_size",
+    "num_inference_steps",
+    "audio_length_in_s",
+    "guidance_scale",
+    "guidance_mode",
+    "shift",
+    "steering_frac_start",
+    "steering_frac_end",
+    "retain_weight",
+    "lr",
+    "weight_decay",
+    "grad_accum_steps",
+    "max_grad_norm",
+    "alpha_min",
+    "alpha_max",
+    "alpha_init",
+    "predictor_channels",
+    "predictor_layers_per_block",
+    "predictor_cond_dim",
+    "seed",
+)
 
-    if len(epochs) <= len(ORDINAL_BLUE):
-        selected = epochs
-    else:
-        stride = (len(epochs) - 1) / (len(ORDINAL_BLUE) - 1)
-        selected = [epochs[round(index * stride)] for index in range(len(ORDINAL_BLUE))]
 
-    fig, ax = plt.subplots(figsize=(9, 5), facecolor=PALETTE["surface"])
-
-    # `alpha=0.5` is the midpoint between full-prompt and retain-prompt classifier-free guidance.
-    if alpha_min < 0.5 < alpha_max:
-        ax.axhline(0.5, color=PALETTE["muted"], linewidth=1.0, linestyle="--", zorder=1)
-        ax.annotate(
-            "α = 0.5 — full/retain midpoint",
-            (0.995, 0.5),
-            xycoords=("axes fraction", "data"),
-            textcoords="offset points",
-            xytext=(0, 5),
-            ha="right",
-            fontsize=8,
-            color=PALETTE["muted"],
+def _validate_resume_configuration(checkpoint: dict[str, Any], args: argparse.Namespace) -> None:
+    saved = checkpoint["args"]
+    missing = [name for name in _RESUME_INVARIANTS if name not in saved]
+    if missing:
+        raise ValueError(f"resume checkpoint is missing exact-training arguments: {missing}")
+    mismatches = []
+    for name in _RESUME_INVARIANTS:
+        previous = saved[name]
+        current = getattr(args, name)
+        if name == "train_csv":
+            previous = str(Path(previous).resolve())
+            current = str(Path(current).resolve())
+        elif name == "predictor_channels":
+            previous = tuple(previous)
+            current = tuple(current)
+        if previous != current:
+            mismatches.append(f"{name}: checkpoint={previous!r}, CLI={current!r}")
+    if mismatches:
+        raise ValueError(
+            "resume would change training semantics; repeat the original flags (only --epochs/runtime/output may "
+            "change): " + "; ".join(mismatches)
         )
 
-    # spread the drawn epochs across the whole ramp rather than crowding one end, so the lightness
-    # gaps stay visible for any epoch count. a lone line is not an ordinal encoding at all
-    if len(selected) == 1:
-        colors = [PALETTE["series"]]
-    else:
-        step_size = (len(ORDINAL_BLUE) - 1) / (len(selected) - 1)
-        colors = [ORDINAL_BLUE[round(index * step_size)] for index in range(len(selected))]
 
-    for record, color in zip(selected, colors, strict=True):
-        timesteps = [timestep for timestep, _ in record["alpha_by_timestep"]]
-        alphas = [alpha for _, alpha in record["alpha_by_timestep"]]
-        ax.plot(timesteps, alphas, color=color, linewidth=2.0, label=f"epoch {record['epoch']}", zorder=2)
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    device = _resolve_device(args.device)
+    _seed_everything(args.seed)
 
-    ax.set_title("Predicted steering strength across the denoising trajectory", fontsize=11, loc="left", pad=10)
-    ax.set_xlabel("denoising timestep (noisy → clean)")
-    ax.set_ylabel("mean α")
-    # denoising runs from high to low timesteps, so read the trajectory left to right
-    ax.invert_xaxis()
-    margin = 0.04 * (alpha_max - alpha_min)
-    ax.set_ylim(alpha_min - margin, alpha_max + margin)
-    style_axes(ax)
-    legend = ax.legend(frameon=False, fontsize=9, loc="best")
-    for text in legend.get_texts():
-        text.set_color(PALETTE["ink_secondary"])
+    checkpoint = None
+    if args.resume is not None:
+        checkpoint = load_checkpoint(
+            args.resume,
+            expected_model_id=args.model_id,
+            expected_model_revision=args.model_revision,
+            expected_components_id=args.components_id,
+            expected_components_revision=args.components_revision,
+            expected_clap_model_id=args.clap_model_id,
+            expected_clap_revision=args.clap_revision,
+            expected_steering_mode=STEERING_MODE,
+            expected_gradient_mode=GRADIENT_MODE,
+        )
+        _validate_resume_configuration(checkpoint, args)
 
-    fig.tight_layout()
-    save_figure(fig, path)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = args.output_dir / "checkpoints"
+    sample_dir = args.output_dir / "audio"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "args.json").write_text(
+        json.dumps(_jsonable_args(args), indent=2), encoding="utf-8"
+    )
 
+    print(f"device={device}, dtype=float32, gradient_mode={GRADIENT_MODE}")
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        print(
+            f"GPU={properties.name}, capability={properties.major}.{properties.minor}, "
+            f"VRAM={properties.total_memory / 2**30:.1f} GiB"
+        )
+    print("thinking=False, dcw_enabled=False, autocast=disabled")
 
-def main() -> None:
-    args = parse_args()
-
-    output_dir = args.output
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(args.seed)
-
-    dataset = PromptTargetDataset(args.dataset, args.max_samples)
+    dataset = PromptTargetDataset(args.train_csv, args.max_samples)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
         collate_fn=collate_prompt_target,
+        pin_memory=device.type == "cuda",
     )
-    print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
-    # Show the effective retain prompt, whether explicit or derived, before an expensive first step.
-    _, example_target, example_retain = dataset.rows[0]
-    print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
+    print(f"loaded {len(dataset)} rows from {args.train_csv}")
 
-    # float32 throughout: the gradient reaches `alpha_t` through the scheduler recurrence, the VAE,
-    # the vocoder and the CLAP tower, and in half precision that chain returns a gradient whose sign
-    # disagrees with a finite-difference check of the same loss more often than not
-    pipe = SteeringMusicLDMPipeline.from_pretrained("ucsd-reach/musicldm", torch_dtype=torch.float32).to(device)
-    pipe.set_progress_bar_config(disable=True)
-    for module in (pipe.unet, pipe.vae, pipe.vocoder, pipe.text_encoder):
-        module.requires_grad_(False)
-        module.eval()
+    pipeline = SteeringAceStepPipeline.from_pretrained(
+        args.model_id,
+        revision=args.model_revision,
+        components_id=args.components_id,
+        components_revision=args.components_revision,
+        device=device,
+        torch_dtype=torch.float32,
+        attention_implementation="eager",
+        sequential_dit=args.sequential_dit,
+        offload_text_encoder=True,
+        offload_dit_after_generation=args.offload_dit_after_generation,
+        cache_conditioning=False,
+    )
+    clap = ClapLoss.from_pretrained(
+        args.clap_model_id,
+        revision=args.clap_revision,
+        torch_dtype=torch.float32,
+    ).eval()
+    clap_dim = int(getattr(clap.text_encoder.config, "projection_dim", 512))
 
-    # the predictor casts its inputs and its output to the latents' dtype itself, so it keeps
-    # working unchanged if the pipeline above is ever loaded in half precision again
-    predictor_config = {
-        "latent_channels": pipe.unet.config.in_channels,
-        "target_embed_dim": pipe.text_encoder.config.projection_dim,
-        "alpha_min": args.alpha_min,
-        "alpha_max": args.alpha_max,
-        "alpha_init": args.alpha_init,
-    }
-    predictor = SteeringPredictor(**predictor_config).to(device)
-    num_parameters = sum(parameter.numel() for parameter in predictor.parameters())
-    print(f"SteeringPredictor: {num_parameters / 1e6:.2f}M parameters, config {predictor_config}")
-
-    clap_loss = ClapLoss(pipe.text_encoder, pipe.tokenizer, pipe.feature_extractor).to(device)
+    predictor_config: dict[str, Any]
+    if checkpoint is not None:
+        predictor_config = dict(checkpoint["config"])
+        if predictor_config.get("target_embed_dim") != clap_dim:
+            raise ValueError(
+                "resume checkpoint CLAP dimension does not match the selected external CLAP model"
+            )
+    else:
+        predictor_config = {
+            "latent_channels": ACE_STEP_LATENT_CHANNELS,
+            "target_embed_dim": clap_dim,
+            "block_out_channels": tuple(args.predictor_channels),
+            "layers_per_block": args.predictor_layers_per_block,
+            "cond_embed_dim": args.predictor_cond_dim,
+            "alpha_min": args.alpha_min,
+            "alpha_max": args.alpha_max,
+            "alpha_init": args.alpha_init,
+        }
+    predictor = SteeringPredictor(**predictor_config).to(device=device, dtype=torch.float32)
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    num_samples = int(args.audio_length_in_s * pipe.vocoder.config.sampling_rate)
+    history: dict[str, Any] = {"args": _jsonable_args(args), "iterations": [], "epochs": []}
+    start_epoch = 1
+    global_step = 0
+    best_loss = float("inf")
+    if checkpoint is not None:
+        predictor.load_state_dict(checkpoint["state_dict"], strict=True)
+        resume = restore_training_state(checkpoint, optimizer=optimizer, restore_rng=True)
+        history = dict(resume["history"])
+        start_epoch = int(resume["epoch"]) + 1
+        global_step = int(resume["global_step"])
+        best_loss = float(resume["best_loss"] if resume["best_loss"] is not None else math.inf)
+        print(f"resumed {args.resume} at epoch {start_epoch}, global_step {global_step}")
+
+    if start_epoch > args.epochs:
+        raise ValueError(f"checkpoint already completed epoch {start_epoch - 1}, but --epochs={args.epochs}")
+
     print(
-        f"Steering {args.num_steered_steps}/{args.num_inference_steps} steps in"
-        f" [{args.steering_frac_start}, {args.steering_frac_end}), {args.audio_length_in_s}s clips"
+        f"predictor={sum(parameter.numel() for parameter in predictor.parameters()) / 1e6:.2f}M params; "
+        f"steering {args.num_steered_steps}/{args.num_inference_steps} steps"
     )
 
-    history: dict = {"args": json.loads(json.dumps(vars(args), default=str)), "iterations": [], "epochs": []}
-    best_loss = float("inf")
-    step = 0
-
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         predictor.train()
         optimizer.zero_grad(set_to_none=True)
-
-        epoch_losses: list[float] = []
-        epoch_target_similarities: list[float] = []
-        epoch_retain_similarities: list[float] = []
-        epoch_alpha_records: list[tuple[float, float]] = []
+        losses: list[float] = []
+        target_scores: list[float] = []
+        retain_scores: list[float] = []
+        alpha_records: list[tuple[float, float]] = []
+        sample_waveform: torch.Tensor | None = None
 
         for batch_index, (prompts, targets, retains) in enumerate(dataloader):
-            step += 1
-            # fresh noise every batch, but reproducible across runs
-            generator = torch.Generator().manual_seed(args.seed + step)
+            global_step += 1
 
-            output = pipe(
-                prompt=prompts,
+            # CLAP text embeddings are independent from ACE-Step's Qwen
+            # embeddings.  Offload CLAP before loading Qwen/DiT on a T4.
+            _move_clap(clap, device)
+            with torch.no_grad():
+                all_text = clap.encode_text([*targets, *retains])
+                target_embeds, retain_embeds = all_text.chunk(2)
+            _move_clap(clap, torch.device("cpu"))
+
+            latent_output = pipeline(
+                prompts,
                 retain_prompt=retains,
-                steering_target=targets,
+                steering_target_embeds=target_embeds.to(device),
                 steering_model=predictor,
+                audio_length_in_s=args.audio_length_in_s,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale,
+                guidance_mode=args.guidance_mode,
+                shift=args.shift,
                 steering_frac_start=args.steering_frac_start,
                 steering_frac_end=args.steering_frac_end,
-                train=True,
-                num_inference_steps=args.num_inference_steps,
-                audio_length_in_s=args.audio_length_in_s,
-                guidance_scale=args.guidance_scale,
-                num_waveforms_per_prompt=1,
-                generator=generator,
+                seed=[args.seed + global_step * args.batch_size + index for index in range(len(prompts))],
                 output_type="latent",
+                train=True,
+                thinking=False,
+                dcw_enabled=False,
             )
-            latents = output.audios
-            epoch_alpha_records.extend(output.alpha_records)
+            latents = latent_output.audios
+            _assert_finite("ACE-Step latents", latents)
+            alpha_records.extend(latent_output.alpha_records)
 
-            # mirrors the pipeline's post-processing, but outside `no_grad` and without the move to
-            # the CPU that `mel_spectrogram_to_waveform` performs
-            mel_spectrogram = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
-            if mel_spectrogram.dim() == 4:
-                mel_spectrogram = mel_spectrogram.squeeze(1)
-            waveform = pipe.vocoder(mel_spectrogram)[:, :num_samples]
+            waveform = pipeline.decode_latents(
+                latents,
+                num_audio_samples=round(args.audio_length_in_s * ACE_STEP_SAMPLE_RATE),
+            )
+            _assert_finite("decoded waveform", waveform)
+            _move_clap(clap, device)
+            audio_embeds = clap.encode_audio(waveform, ACE_STEP_SAMPLE_RATE)
+            _assert_finite("CLAP audio embeddings", audio_embeds)
 
-            audio_embeds = clap_loss.encode_audio(waveform, pipe.vocoder.config.sampling_rate)
+            target_embeds = target_embeds.to(device=device, dtype=audio_embeds.dtype)
+            retain_embeds = retain_embeds.to(device=device, dtype=audio_embeds.dtype)
+            target_similarity = (audio_embeds * target_embeds).sum(dim=-1)
+            retain_similarity = (audio_embeds * retain_embeds).sum(dim=-1)
+            objective = target_similarity.mean() + args.retain_weight * (
+                1.0 - retain_similarity
+            ).mean()
+            _assert_finite("training objective", objective)
+            group_start = (batch_index // args.grad_accum_steps) * args.grad_accum_steps
+            accumulation_group_size = min(args.grad_accum_steps, len(dataloader) - group_start)
+            (objective / accumulation_group_size).backward()
 
-            # `ClapLoss` returns `1 - cosine_similarity`, so negating it maximizes the distance to
-            # the target, i.e. suppresses the concept the prompt asks for
-            target_distance = clap_loss(audio_embeds, targets)
-            loss = -target_distance
-
-            # the same quantity against the prompt without the target, this time minimized, so the
-            # audio keeps everything the prompt asks for besides the concept being suppressed
-            retain_distance = clap_loss(audio_embeds, retains) if args.retain_weight > 0.0 else None
-            if retain_distance is not None:
-                loss = loss + args.retain_weight * retain_distance
-
-            (loss / args.grad_accum_steps).backward()
-
-            grad_norm = None
-            is_last_batch = batch_index == len(dataloader) - 1
-            if (batch_index + 1) % args.grad_accum_steps == 0 or is_last_batch:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(predictor.parameters(), args.max_grad_norm))
+            should_step = (batch_index + 1) % args.grad_accum_steps == 0 or batch_index + 1 == len(dataloader)
+            if should_step:
+                gradient_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), args.max_grad_norm)
+                if not torch.isfinite(gradient_norm):
+                    raise FloatingPointError("non-finite predictor gradient norm")
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            loss_value = float(loss.detach())
-            target_similarity = 1.0 - float(target_distance.detach())
-            # measured even when the term is switched off, since it is the diagnostic that tells
-            # concept removal apart from plain audio degradation
-            with torch.no_grad():
-                retain_similarity = (
-                    1.0 - float(retain_distance.detach())
-                    if retain_distance is not None
-                    else 1.0 - float(clap_loss(audio_embeds.detach(), retains))
-                )
-            epoch_losses.append(loss_value)
-            epoch_target_similarities.append(target_similarity)
-            epoch_retain_similarities.append(retain_similarity)
-            history["iterations"].append(
+            sample_waveform = waveform[0].detach().cpu()
+            loss_value = float(objective.detach())
+            target_value = float(target_similarity.detach().mean())
+            retain_value = float(retain_similarity.detach().mean())
+            losses.append(loss_value)
+            target_scores.append(target_value)
+            retain_scores.append(retain_value)
+            history.setdefault("iterations", []).append(
                 {
-                    "step": step,
                     "epoch": epoch,
+                    "batch": batch_index + 1,
+                    "global_step": global_step,
                     "loss": loss_value,
-                    "target_similarity": target_similarity,
-                    "retain_similarity": retain_similarity,
-                    "grad_norm": grad_norm,
+                    "target_similarity": target_value,
+                    "retain_similarity": retain_value,
                 }
             )
             print(
-                f"epoch {epoch}/{args.epochs} batch {batch_index + 1}/{len(dataloader)}"
-                f" loss {loss_value:+.4f} target_cos {target_similarity:+.4f} retain_cos {retain_similarity:+.4f}"
-                f" grad_norm {'-' if grad_norm is None else f'{grad_norm:.3e}'}",
-                flush=True,
+                f"epoch {epoch}/{args.epochs} batch {batch_index + 1}/{len(dataloader)} "
+                f"loss={loss_value:.4f} target={target_value:.4f} retain={retain_value:.4f}"
             )
 
-        epoch_loss = sum(epoch_losses) / len(epoch_losses)
-        history["epochs"].append(
-            {
-                "epoch": epoch,
-                "last_step": step,
-                "loss": epoch_loss,
-                "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
-                "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
-                "alpha_by_timestep": mean_alpha_by_timestep(epoch_alpha_records),
-            }
-        )
-        print(f"epoch {epoch}/{args.epochs} mean loss {epoch_loss:+.4f}")
+            # The backward pass no longer needs the frozen VAE/CLAP weights.
+            del waveform, audio_embeds, objective, latents, latent_output
+            pipeline.offload_vae()
+            _move_clap(clap, torch.device("cpu"))
 
-        checkpoint = {
-            "state_dict": predictor.state_dict(),
-            "config": predictor_config,
-            "steering_mode": STEERING_MODE,
-            "args": history["args"],
+        epoch_loss = float(np.mean(losses))
+        epoch_record = {
             "epoch": epoch,
             "loss": epoch_loss,
+            "target_similarity": float(np.mean(target_scores)),
+            "retain_similarity": float(np.mean(retain_scores)),
+            "alpha_by_timestep": _mean_alpha(alpha_records),
         }
-        torch.save(checkpoint, output_dir / "steering_predictor.pt")
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            torch.save(checkpoint, output_dir / "steering_predictor_best.pt")
+        history.setdefault("epochs", []).append(epoch_record)
+        is_best = epoch_loss <= best_loss
+        best_loss = min(best_loss, epoch_loss)
 
-        # written every epoch so an interrupted run keeps its numbers, and doubles as the
-        # machine-readable twin of the two plots
-        (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-        plot_loss_curve(history, output_dir / "loss_curve.png")
-        plot_alpha_schedule(history, output_dir / "alpha_schedule.png", args.alpha_min, args.alpha_max)
+        payload = build_checkpoint(
+            state_dict=predictor.state_dict(),
+            config=predictor_config,
+            optimizer_state_dict=optimizer.state_dict(),
+            history=history,
+            args=_jsonable_args(args),
+            epoch=epoch,
+            global_step=global_step,
+            batch_in_epoch=0,
+            loss=epoch_loss,
+            best_loss=best_loss,
+            model_id=args.model_id,
+            model_revision=args.model_revision,
+            components_id=args.components_id,
+            components_revision=args.components_revision,
+            clap_model_id=args.clap_model_id,
+            clap_revision=args.clap_revision,
+            gradient_mode=GRADIENT_MODE,
+        )
+        save_checkpoint(payload, checkpoint_dir / "latest.pt")
+        if is_best:
+            save_checkpoint(payload, checkpoint_dir / "best.pt")
+        if sample_waveform is not None:
+            save_waveform(sample_dir / f"epoch_{epoch:03d}.wav", sample_waveform, ACE_STEP_SAMPLE_RATE)
+        (args.output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        _plot_history(history, args.output_dir)
 
-    print(f"\nDone. Best epoch mean loss {best_loss:+.4f}. Artifacts in {output_dir.resolve()}")
+    print(f"training complete; latest checkpoint: {checkpoint_dir / 'latest.pt'}")
 
 
 if __name__ == "__main__":
