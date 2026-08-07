@@ -30,6 +30,13 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
+
+import matplotlib
+
+# non-interactive backend: this script only saves figures to disk and never calls `plt.show()`, and
+# the default TkAgg backend on Windows raises a spurious "main thread is not in main loop" from
+# tkinter's Image.__del__ when the garbage collector runs between epochs
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
