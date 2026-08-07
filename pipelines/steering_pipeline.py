@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -8,6 +7,8 @@ import torch.utils.checkpoint
 from diffusers import MusicLDMPipeline
 from diffusers.pipelines.pipeline_utils import AudioPipelineOutput
 from diffusers.utils import is_torch_xla_available
+
+from utils import tensor_text_features
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -40,34 +41,6 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
     window, generation is identical to the base `MusicLDMPipeline`.
     """
 
-    @contextmanager
-    def _tensor_text_features(self):
-        r"""
-        Makes `text_encoder.get_text_features` return a plain tensor for the duration of the context.
-
-        `transformers >= 5` returns a `BaseModelOutputWithPooling`, while both the inherited
-        `_encode_prompt` and `_encode_steering_target` expect the tensor that earlier versions
-        returned. `MusicLDMPipeline` is deprecated upstream (`_last_supported_version = "0.33.1"`),
-        so this shim patches the call site instead of duplicating `_encode_prompt`.
-        """
-        was_patched = "get_text_features" in self.text_encoder.__dict__
-        original_get_text_features = self.text_encoder.get_text_features
-
-        def get_text_features(*args, **kwargs):
-            text_features = original_get_text_features(*args, **kwargs)
-            if not torch.is_tensor(text_features):
-                text_features = text_features.pooler_output
-            return text_features
-
-        self.text_encoder.get_text_features = get_text_features
-        try:
-            yield
-        finally:
-            if was_patched:
-                self.text_encoder.get_text_features = original_get_text_features
-            else:
-                del self.text_encoder.get_text_features
-
     def _encode_steering_target(self, steering_target, batch_size, num_waveforms_per_prompt, device, dtype):
         if isinstance(steering_target, str):
             steering_targets = [steering_target] * batch_size
@@ -82,7 +55,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         else:
             raise ValueError(f"`steering_target` has to be of type `str` or `list` but is {type(steering_target)}")
 
-        with torch.no_grad(), self._tensor_text_features():
+        with torch.no_grad(), tensor_text_features(self.text_encoder):
             text_inputs = self.tokenizer(
                 steering_targets,
                 padding="max_length",
@@ -171,7 +144,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt and steering target
-        with torch.no_grad(), self._tensor_text_features():
+        with torch.no_grad(), tensor_text_features(self.text_encoder):
             prompt_embeds = self._encode_prompt(
                 prompt,
                 device,
