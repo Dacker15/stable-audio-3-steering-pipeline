@@ -9,7 +9,10 @@ dependencies = [
     "diffusers>=0.39.0",
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
+    "stable-audio-3",
     "torch>=2.3.0",
+    "torchaudio>=2.3.0",
+    "torchsde>=0.2.6",
     "transformers>=5.14.1",
 ]
 
@@ -24,7 +27,13 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
+# `stable-audio-3` is not published on PyPI, it only exists as a git repository.
+stable-audio-3 = { git = "https://github.com/Stability-AI/stable-audio-3" }
 torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
+    { index = "pytorch-cpu", marker = "sys_platform != 'win32' or platform_machine != 'AMD64'" },
+]
+torchaudio = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
     { index = "pytorch-cpu", marker = "sys_platform != 'win32' or platform_machine != 'AMD64'" },
 ]
@@ -32,6 +41,11 @@ torchvision = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" },
     { index = "pytorch-cpu", marker = "sys_platform != 'win32' or platform_machine != 'AMD64'" },
 ]
+
+[tool.uv]
+# `stable-audio-3` pins `torch==2.7.1` and `torchaudio==2.7.1`, which are not published on the cu130
+# index this project builds against, so the pins are relaxed back to the project's own bounds.
+override-dependencies = ["torch>=2.3.0", "torchaudio>=2.3.0"]
 
 [build-system]
 requires = ["hatchling"]
