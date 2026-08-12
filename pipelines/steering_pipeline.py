@@ -10,6 +10,8 @@ from diffusers.utils import is_torch_xla_available
 
 from utils import tensor_text_features
 
+STEERING_MODE = "full_to_retain_v1"
+
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -34,11 +36,12 @@ class SteeringAudioPipelineOutput(AudioPipelineOutput):
 
 class SteeringMusicLDMPipeline(MusicLDMPipeline):
     r"""
-    `MusicLDMPipeline` variant that steers denoising towards/away from a target concept
-    over a sub-range of the denoising trajectory, using an external `steering_model`
-    that predicts a per-step scalar `alpha_t`. Inside the steering window, the CFG
-    guidance scale is replaced by `(1.0 - 2.0 * alpha_t) * guidance_scale`; outside the
-    window, generation is identical to the base `MusicLDMPipeline`.
+    `MusicLDMPipeline` variant that steers denoising away from a target concept over a sub-range of
+    the denoising trajectory. An external `steering_model` predicts a per-step scalar `alpha_t`.
+    Inside the steering window, `alpha_t` interpolates between classifier-free guidance for the
+    full prompt and classifier-free guidance for a `retain_prompt` with the target removed. Thus
+    `alpha_t = 0` reproduces the ordinary full-prompt generation and `alpha_t = 1` follows the
+    retain prompt. Outside the window, generation is identical to the base `MusicLDMPipeline`.
     """
 
     def _encode_steering_target(self, steering_target, batch_size, num_waveforms_per_prompt, device, dtype):
@@ -75,6 +78,38 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         target_embed = target_embed.view(batch_size * num_waveforms_per_prompt, seq_len)
         return target_embed
 
+    @staticmethod
+    def _prepare_retain_prompt(retain_prompt, batch_size):
+        def validate(value, index=None):
+            location = "" if index is None else f" at index {index}"
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"`retain_prompt`{location} has to be a non-empty string but is {value!r}")
+            return value.strip()
+
+        if isinstance(retain_prompt, str):
+            return [validate(retain_prompt)] * batch_size
+        if isinstance(retain_prompt, list):
+            if len(retain_prompt) != batch_size:
+                raise ValueError(
+                    f"`retain_prompt` has batch size {len(retain_prompt)}, but `prompt` has batch size"
+                    f" {batch_size}. Please make sure that passed `retain_prompt` matches the batch size of"
+                    " `prompt`."
+                )
+            return [validate(value, index) for index, value in enumerate(retain_prompt)]
+        raise ValueError(f"`retain_prompt` has to be of type `str` or `list` but is {type(retain_prompt)}")
+
+    @staticmethod
+    def _interpolate_cfg_predictions(
+        noise_pred_uncond,
+        noise_pred_full,
+        noise_pred_retain,
+        guidance_scale,
+        alpha_t,
+    ):
+        noise_pred_full_cfg = noise_pred_uncond + guidance_scale * (noise_pred_full - noise_pred_uncond)
+        noise_pred_retain_cfg = noise_pred_uncond + guidance_scale * (noise_pred_retain - noise_pred_uncond)
+        return noise_pred_full_cfg + alpha_t * (noise_pred_retain_cfg - noise_pred_full_cfg)
+
     def __call__(
         self,
         prompt: str | list[str] = None,
@@ -94,6 +129,7 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         cross_attention_kwargs: dict[str, Any] | None = None,
         output_type: str | None = "np",
         steering_target: str | list[str] = None,
+        retain_prompt: str | list[str] = None,
         steering_model: torch.nn.Module = None,
         steering_frac_start: float = 0.0,
         steering_frac_end: float = 1.0,
@@ -103,7 +139,13 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
         Extends `MusicLDMPipeline.__call__` with concept steering.
 
         Args:
-            steering_target (`str` or `list[str]`): The concept(s) the `steering_model` should steer generation towards/away from. If a list, must match the batch size of `prompt`.
+            steering_target (`str` or `list[str]`): The concept(s) to suppress and the target
+                conditioning passed to `steering_model`. If a list, it must match the batch size of
+                `prompt`.
+            retain_prompt (`str` or `list[str]`): Prompt(s) describing what generation should preserve,
+                normally the full prompt with `steering_target` removed. Inside the steering window,
+                `alpha_t` interpolates from full-prompt CFG (`alpha_t = 0`) to retain-prompt CFG
+                (`alpha_t = 1`). If a list, it must match the batch size of `prompt`.
             steering_model (`torch.nn.Module`): Model called as `steering_model(latents=..., t=..., target_embed=...)` to predict `alpha_t`.
             steering_frac_start (`float`, *optional*, defaults to 0.0): Fraction of the denoising loop (by step index) where steering begins.
             steering_frac_end (`float`, *optional*, defaults to 1.0): Fraction of the denoising loop (by step index) where steering ends.
@@ -142,8 +184,16 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
 
         device = self._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
+        steering_enabled = do_classifier_free_guidance and steering_model is not None
 
-        # 3. Encode input prompt and steering target
+        if steering_enabled:
+            if steering_target is None:
+                raise ValueError("`steering_target` must be provided when `steering_model` is enabled")
+            retain_prompts = self._prepare_retain_prompt(retain_prompt, batch_size)
+        else:
+            retain_prompts = None
+
+        # 3. Encode the full prompt, retain prompt and steering target
         with torch.no_grad(), tensor_text_features(self.text_encoder):
             prompt_embeds = self._encode_prompt(
                 prompt,
@@ -154,14 +204,32 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
             )
+            if steering_enabled:
+                # Only the conditional retain embeddings are needed. During steering they share
+                # the same unconditional/negative prediction already encoded for the full prompt.
+                retain_prompt_embeds = self._encode_prompt(
+                    retain_prompts,
+                    device,
+                    num_waveforms_per_prompt,
+                    False,
+                    None,
+                ).to(device=device, dtype=prompt_embeds.dtype)
 
-        target_embed = self._encode_steering_target(
-            steering_target,
-            batch_size,
-            num_waveforms_per_prompt,
-            device,
-            prompt_embeds.dtype,
-        )
+        if steering_enabled:
+            target_embed = self._encode_steering_target(
+                steering_target,
+                batch_size,
+                num_waveforms_per_prompt,
+                device,
+                prompt_embeds.dtype,
+            )
+            unconditional_prompt_embeds, full_prompt_embeds = prompt_embeds.chunk(2)
+            steering_prompt_embeds = torch.cat(
+                [unconditional_prompt_embeds, full_prompt_embeds, retain_prompt_embeds], dim=0
+            )
+        else:
+            target_embed = None
+            steering_prompt_embeds = None
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -189,8 +257,21 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                step_frac = i / num_inference_steps
+                steering_active = steering_enabled and steering_frac_start <= step_frac < steering_frac_end
+
+                # During an active steering step the UNet evaluates the common negative condition,
+                # the full prompt and the retain prompt in one batch. Outside the window it keeps
+                # the ordinary two-way CFG batch.
+                if steering_active:
+                    latent_model_input = torch.cat([latents] * 3)
+                    step_prompt_embeds = steering_prompt_embeds
+                elif do_classifier_free_guidance:
+                    latent_model_input = torch.cat([latents] * 2)
+                    step_prompt_embeds = prompt_embeds
+                else:
+                    latent_model_input = latents
+                    step_prompt_embeds = prompt_embeds
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
@@ -199,19 +280,16 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                         latent_model_input,
                         t,
                         encoder_hidden_states=None,
-                        class_labels=prompt_embeds,
+                        class_labels=step_prompt_embeds,
                         cross_attention_kwargs=cross_attention_kwargs,
                         return_dict=False,
                     )[0]
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-
-                    step_frac = i / num_inference_steps
-                    steering_active = steering_frac_start <= step_frac < steering_frac_end
-
                     if steering_active:
+                        noise_pred_uncond, noise_pred_full, noise_pred_retain = noise_pred.chunk(3)
+
                         if train:
                             # the predictor runs once per steered step and every one of those
                             # activations would be held until the backward pass; recomputing them
@@ -237,11 +315,16 @@ class SteeringMusicLDMPipeline(MusicLDMPipeline):
                             with torch.no_grad():
                                 alpha_t = steering_model(latents=latents, t=t, target_embed=target_embed)
                         records.append((float(t), float(alpha_t.detach().float().mean())))
-                        effective_guidance_scale = (1.0 - 2.0 * alpha_t) * guidance_scale
+                        noise_pred = self._interpolate_cfg_predictions(
+                            noise_pred_uncond,
+                            noise_pred_full,
+                            noise_pred_retain,
+                            guidance_scale,
+                            alpha_t,
+                        )
                     else:
-                        effective_guidance_scale = guidance_scale
-
-                    noise_pred = noise_pred_uncond + effective_guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample

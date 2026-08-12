@@ -121,9 +121,9 @@ class SteeringPredictor(nn.Module):
     r"""
     Predicts the per-step steering strength `alpha_t` consumed by `SteeringMusicLDMPipeline`.
 
-    The pipeline replaces the classifier-free guidance scale inside the steering window with
-    `(1.0 - 2.0 * alpha_t) * guidance_scale`, so with the default range `alpha_t = 0` reproduces
-    plain CFG, `alpha_t = 0.5` disables guidance and `alpha_t = 1` fully inverts it.
+    The pipeline uses `alpha_t` to interpolate between classifier-free guidance for the full prompt
+    and classifier-free guidance for the retain prompt. With the default range, `alpha_t = 0`
+    reproduces the full-prompt generation and `alpha_t = 1` follows the retain prompt.
 
     Architecture: a FiLM-conditioned convolutional encoder over the intermediate latents with
     multi-scale statistical pooling. Convolutions read local time-frequency structure, FiLM injects
@@ -152,9 +152,9 @@ class SteeringPredictor(nn.Module):
         norm_num_groups (`int`, *optional*, defaults to 32): Upper bound on the number of `GroupNorm` groups.
         alpha_min (`float`, *optional*, defaults to 0.0): Lower bound of the predicted `alpha_t`.
         alpha_max (`float`, *optional*, defaults to 1.0): Upper bound of the predicted `alpha_t`.
-        alpha_init (`float` or `None`, *optional*): Value every sample is initialized to, so that an untrained
-            predictor reproduces the unsteered pipeline. Must lie strictly inside
-            `(alpha_min, alpha_max)`. Defaults to `alpha_min + 0.01 * (alpha_max - alpha_min)`.
+        alpha_init (`float` or `None`, *optional*): Value every sample is initialized to. Must lie strictly inside
+            `(alpha_min, alpha_max)`. Defaults to `alpha_min + 0.15 * (alpha_max - alpha_min)`, which starts with a
+            modest retain-prompt contribution without placing the sigmoid close to saturation.
         normalize_latents (`bool`, *optional*, defaults to `True`): Whether to instance-normalize the latents before
             the encoder.
     """
@@ -186,9 +186,9 @@ class SteeringPredictor(nn.Module):
         alpha_range = alpha_max - alpha_min
 
         if alpha_init is None:
-            # just inside `alpha_min`, i.e. base CFG behaviour. deliberately not the midpoint of the
-            # range, which for the default range would start training with `guidance_scale = 0`
-            alpha_init = alpha_min + 0.01 * alpha_range
+            # Start close to the full-prompt baseline, but far enough from the sigmoid boundary for
+            # the controller to receive a useful gradient in either direction.
+            alpha_init = alpha_min + 0.15 * alpha_range
         elif not alpha_min < alpha_init < alpha_max:
             raise ValueError(
                 f"`alpha_init` has to lie strictly between `alpha_min` and `alpha_max` but got {alpha_init}, which is"
@@ -245,9 +245,8 @@ class SteeringPredictor(nn.Module):
             nn.Linear(cond_embed_dim, 1),
         )
 
-        # start every sample at ~`alpha_init` so an untrained predictor reproduces the unsteered
-        # pipeline. the weight is near-zero rather than exactly zero so that gradients still reach
-        # the encoder on the very first optimizer step
+        # Start every sample at ~`alpha_init`. The weight is near-zero rather than exactly zero so
+        # that gradients still reach the encoder on the very first optimizer step.
         nn.init.normal_(self.head[-1].weight, std=1e-3)
         normalized_alpha_init = (alpha_init - alpha_min) / alpha_range
         nn.init.constant_(self.head[-1].bias, math.log(normalized_alpha_init / (1.0 - normalized_alpha_init)))

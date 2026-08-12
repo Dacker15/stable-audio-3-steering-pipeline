@@ -5,10 +5,11 @@ Each training step generates a full batch of waveforms with steering enabled, em
 CLAP audio tower and scores them against two texts:
 
 * the steering target, whose cosine distance is *maximized*, so the predictor learns a per-timestep
-  `alpha_t` that steers the denoising trajectory away from the target concept even though the prompt
-  asks for it;
-* the retain prompt, i.e. the prompt with the target removed (`utils.strip_target`), whose cosine
-  distance is *minimized*, so everything else the prompt asks for survives the suppression.
+  `alpha_t` that moves the denoising trajectory from full-prompt guidance towards retain-prompt
+  guidance;
+* the retain prompt supplied by the dataset (or derived with `utils.strip_target` for legacy
+  two-column CSVs), whose cosine distance is *minimized*, so everything else the prompt asks for
+  survives the suppression.
 
 The retain term is what separates removing the concept from degrading the audio: silence and noise
 are both far from the target, and only the retain term tells them apart from a faithful rendition of
@@ -21,8 +22,8 @@ so the gradient flows to each `alpha_t` through the scheduler's linear recurrenc
 first-order approximation of the true gradient and is what keeps the unrolled trajectory affordable.
 
 Example:
-    uv run python scripts/train.py --dataset datasets/trumpet_prompts_dataset.csv --batch-size 2 \
-        --output outputs/trumpet --epochs 5 --steering-frac-start 0.1 --steering-frac-end 0.8
+    uv run python scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv --batch-size 2 \
+        --output outputs/trumpet-target-specific --epochs 5 --steering-frac-start 0.1 --steering-frac-end 0.8
 """
 
 import argparse
@@ -41,7 +42,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from losses import ClapLoss
-from pipelines import SteeringMusicLDMPipeline, SteeringPredictor
+from pipelines import STEERING_MODE, SteeringMusicLDMPipeline, SteeringPredictor
 from utils import PromptTargetDataset, collate_prompt_target
 
 # static light-surface artifacts: chrome and ink from the reference palette, the first two
@@ -102,7 +103,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     data = parser.add_argument_group("data and output")
-    data.add_argument("--dataset", type=Path, required=True, help="CSV file with `prompt` and `target` columns")
+    data.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        help="CSV with prompt,target and preferably an explicit retain_prompt column",
+    )
     data.add_argument("--output", type=Path, default=Path("outputs"), help="folder for weights and plots")
     data.add_argument("--batch-size", type=int, default=1, help="prompts generated per forward pass")
     data.add_argument("--max-samples", type=int, default=None, help="use only the first N rows of the dataset")
@@ -112,6 +118,12 @@ def parse_args() -> argparse.Namespace:
     steering.add_argument("--steering-frac-end", type=float, default=0.8, help="fraction of the loop steering ends")
     steering.add_argument("--alpha-min", type=float, default=0.0, help="lower bound of the predicted alpha_t")
     steering.add_argument("--alpha-max", type=float, default=1.0, help="upper bound of the predicted alpha_t")
+    steering.add_argument(
+        "--alpha-init",
+        type=float,
+        default=0.15,
+        help="initial alpha_t: 0 follows the full prompt and 1 follows the retain prompt",
+    )
 
     optim = parser.add_argument_group("optimization")
     optim.add_argument("--epochs", type=int, default=5)
@@ -156,6 +168,15 @@ def parse_args() -> argparse.Namespace:
         # a negative weight would push the audio away from the rest of the prompt as well, i.e. ask
         # for degraded audio outright
         raise ValueError(f"`--retain-weight` has to be non-negative but is {args.retain_weight}")
+    if args.alpha_min >= args.alpha_max:
+        raise ValueError(
+            f"`--alpha-min` has to be smaller than `--alpha-max` but got {args.alpha_min} >= {args.alpha_max}"
+        )
+    if not args.alpha_min < args.alpha_init < args.alpha_max:
+        raise ValueError(
+            f"`--alpha-init` has to lie strictly inside ({args.alpha_min}, {args.alpha_max}) but is"
+            f" {args.alpha_init}"
+        )
     if not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0:
         raise ValueError(
             "`--steering-frac-start` and `--steering-frac-end` have to satisfy"
@@ -308,12 +329,11 @@ def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: 
 
     fig, ax = plt.subplots(figsize=(9, 5), facecolor=PALETTE["surface"])
 
-    # the mechanism replaces the guidance scale with `(1 - 2 * alpha) * guidance_scale`, so 0.5 is
-    # the point where guidance switches off and above it guidance is inverted
+    # `alpha=0.5` is the midpoint between full-prompt and retain-prompt classifier-free guidance.
     if alpha_min < 0.5 < alpha_max:
         ax.axhline(0.5, color=PALETTE["muted"], linewidth=1.0, linestyle="--", zorder=1)
         ax.annotate(
-            "α = 0.5 — guidance off, inverted above",
+            "α = 0.5 — full/retain midpoint",
             (0.995, 0.5),
             xycoords=("axes fraction", "data"),
             textcoords="offset points",
@@ -370,8 +390,7 @@ def main() -> None:
         collate_fn=collate_prompt_target,
     )
     print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
-    # the retain prompt is derived rather than supplied, so show one: a bad strip is otherwise only
-    # visible in the metrics, several hours in
+    # Show the effective retain prompt, whether explicit or derived, before an expensive first step.
     _, example_target, example_retain = dataset.rows[0]
     print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
 
@@ -391,6 +410,7 @@ def main() -> None:
         "target_embed_dim": pipe.text_encoder.config.projection_dim,
         "alpha_min": args.alpha_min,
         "alpha_max": args.alpha_max,
+        "alpha_init": args.alpha_init,
     }
     predictor = SteeringPredictor(**predictor_config).to(device)
     num_parameters = sum(parameter.numel() for parameter in predictor.parameters())
@@ -425,6 +445,7 @@ def main() -> None:
 
             output = pipe(
                 prompt=prompts,
+                retain_prompt=retains,
                 steering_target=targets,
                 steering_model=predictor,
                 steering_frac_start=args.steering_frac_start,
@@ -517,6 +538,7 @@ def main() -> None:
         checkpoint = {
             "state_dict": predictor.state_dict(),
             "config": predictor_config,
+            "steering_mode": STEERING_MODE,
             "args": history["args"],
             "epoch": epoch,
             "loss": epoch_loss,

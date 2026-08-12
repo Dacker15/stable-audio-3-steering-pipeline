@@ -6,6 +6,13 @@ from pathlib import Path
 from torch.utils.data import Dataset
 
 
+def _target_pattern(target: str) -> str | None:
+    words = target.split()
+    if not words:
+        return None
+    return r"\b" + r"\s+".join(re.escape(word) for word in words) + r"(?:'s|es|s)?\b"
+
+
 def strip_target(prompt: str, target: str) -> str:
     r"""
     Removes every mention of `target` from `prompt`, leaving everything else the prompt asks for.
@@ -28,11 +35,10 @@ def strip_target(prompt: str, target: str) -> str:
         `str`: `prompt` without the target, or `prompt` unchanged if the target does not occur in it
         or if removing it would leave nothing but punctuation.
     """
-    words = target.split()
-    if not words:
+    pattern = _target_pattern(target)
+    if pattern is None:
         return prompt
 
-    pattern = r"\b" + r"\s+".join(re.escape(word) for word in words) + r"(?:'s|es|s)?\b"
     stripped = re.sub(pattern, "", prompt, flags=re.IGNORECASE)
 
     # clean up the debris the removal leaves: doubled spaces, punctuation that lost the word it
@@ -50,48 +56,90 @@ def strip_target(prompt: str, target: str) -> str:
 
 class PromptTargetDataset(Dataset):
     r"""
-    Reads the `prompt,target` CSV consumed by `SteeringMusicLDMPipeline`.
+    Reads the prompt CSV consumed by `SteeringMusicLDMPipeline`.
 
-    Every row also carries the retain prompt derived by `strip_target`, i.e. the prompt with the
-    target concept removed, so that the suppression and the retain side of the objective are built
-    from one deterministic source instead of being re-derived per script.
+    A CSV may contain either `prompt,target` or `prompt,target,retain_prompt`. An explicit
+    `retain_prompt` is used as written (apart from surrounding whitespace); the two-column format
+    falls back to `strip_target` for backwards compatibility. If the column is present, every row
+    must provide a non-empty retain prompt that does not still mention its target.
 
     Args:
-        path (`Path`): Path to a CSV file with a `prompt` and a `target` column.
+        path (`Path`): Path to a CSV file with `prompt` and `target` columns and, optionally, a
+            `retain_prompt` column.
         max_samples (`int` or `None`, *optional*): Keep only the first `max_samples` rows. Useful for
             smoke tests, since one optimizer step costs a full generation.
     """
 
     def __init__(self, path: Path, max_samples: int | None = None):
-        with open(path, newline="", encoding="utf-8-sig") as csv_file:
+        if max_samples is not None and (isinstance(max_samples, bool) or not isinstance(max_samples, int)):
+            raise TypeError(f"`max_samples` has to be an integer or `None` but is {type(max_samples).__name__}")
+        if max_samples is not None and max_samples < 1:
+            raise ValueError(f"`max_samples` has to be at least 1 but is {max_samples}")
+
+        path = Path(path)
+        with path.open(newline="", encoding="utf-8-sig") as csv_file:
             reader = csv.DictReader(csv_file)
-            missing = {"prompt", "target"} - set(reader.fieldnames or [])
+            fieldnames = reader.fieldnames or []
+            duplicate_columns = sorted({name for name in fieldnames if fieldnames.count(name) > 1})
+            if duplicate_columns:
+                raise ValueError(f"`dataset` {path} has duplicate columns {duplicate_columns}")
+
+            missing = {"prompt", "target"} - set(fieldnames)
             if missing:
                 raise ValueError(
                     f"`dataset` has to contain a `prompt` and a `target` column but {sorted(missing)} are missing from"
                     f" {path}, which has columns {reader.fieldnames}"
                 )
-            rows = [
-                (row["prompt"].strip(), row["target"].strip())
-                for row in reader
-                if (row.get("prompt") or "").strip() and (row.get("target") or "").strip()
-            ]
+
+            has_explicit_retain = "retain_prompt" in fieldnames
+            rows: list[tuple[str, str, str]] = []
+            for row in reader:
+                line_number = reader.line_num
+                if None in row:
+                    raise ValueError(
+                        f"`dataset` {path} has values without a matching header at CSV line {line_number}"
+                    )
+
+                prompt = (row.get("prompt") or "").strip()
+                target = (row.get("target") or "").strip()
+                if not prompt or not target:
+                    missing_values = [name for name, value in (("prompt", prompt), ("target", target)) if not value]
+                    raise ValueError(
+                        f"`dataset` {path} has empty required value(s) {missing_values} at CSV line {line_number}"
+                    )
+
+                if has_explicit_retain:
+                    retain = (row.get("retain_prompt") or "").strip()
+                    if not retain or not re.search(r"\w", retain):
+                        raise ValueError(
+                            f"`dataset` {path} has an empty `retain_prompt` at CSV line {line_number}"
+                        )
+
+                    target_pattern = _target_pattern(target)
+                    if target_pattern is not None and re.search(target_pattern, retain, flags=re.IGNORECASE):
+                        raise ValueError(
+                            f"`dataset` {path} has a `retain_prompt` that still mentions target {target!r} at CSV"
+                            f" line {line_number}: {retain!r}"
+                        )
+                else:
+                    retain = strip_target(prompt, target)
+
+                rows.append((prompt, target, retain))
 
         if not rows:
             raise ValueError(f"`dataset` has to contain at least one non-empty row but {path} contains none")
 
         rows = rows if max_samples is None else rows[:max_samples]
+        self.rows = rows
 
-        self.rows = [(prompt, target, strip_target(prompt, target)) for prompt, target in rows]
-
-        # a retain prompt identical to the prompt means the target was never mentioned in it, so the
-        # retain term would pull the audio towards the concept the suppression term pushes it away
-        # from. worth surfacing once, since it is a property of the data rather than of a run
+        # An identical retain prompt means that the row supplied no lexical evidence that the target
+        # was removed. Keep this a warning: an explicit retain may legitimately remove a synonym
+        # that cannot be inferred from the canonical target string.
         unchanged = [index for index, (prompt, _, retain) in enumerate(self.rows) if retain == prompt]
         if unchanged:
             warnings.warn(
-                f"{len(unchanged)} of {len(self.rows)} rows of {path} contain no mention of their target, so their"
-                f" retain prompt is the full prompt and the retain loss there works against the suppression loss."
+                f"{len(unchanged)} of {len(self.rows)} selected rows of {path} have a retain prompt identical to the"
+                " full prompt, so the retain and suppression objectives may conflict."
                 f" First such row: index {unchanged[0]}, target {self.rows[unchanged[0]][1]!r}.",
                 stacklevel=2,
             )

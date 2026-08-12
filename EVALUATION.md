@@ -6,8 +6,9 @@
 
 Every prompt/seed pair is generated with identical initial noise under:
 
-- `base`: constant `alpha=0`, exactly preserving the ordinary CFG formula;
-- `learned`: the `SteeringPredictor` loaded from the checkpoint;
+- `base`: constant `alpha=0`, exactly preserving full-prompt CFG;
+- `learned`: the `SteeringPredictor` loaded from the checkpoint, interpolating from full-prompt CFG
+  towards retain-prompt CFG;
 - optional fixed-alpha controls supplied through `--fixed-alphas`.
 
 Evaluation runs with batch size one because the current pipeline records alpha averaged across the batch. This makes each recorded schedule belong unambiguously to one prompt.
@@ -18,21 +19,36 @@ First produce a checkpoint with the existing training entry point, for example:
 
 ```powershell
 uv run python scripts/train.py `
-  --dataset datasets/trumpet_prompts_dataset.csv `
-  --output outputs/trumpet
+  --dataset datasets/trumpet_simple_splits/train.csv `
+  --output outputs/trumpet-target-specific
 ```
+
+Create the group-aware splits first with:
+
+```powershell
+uv run python scripts/create_simple_splits.py `
+  --input datasets/trumpet_prompts_simple_dataset.csv `
+  --output-dir datasets/trumpet_simple_splits `
+  --seed 42
+```
+
+The split contains 132/44/44 train/validation/test rows. The two templates that share a genre and
+accompaniment are assigned together, preventing their near-duplicate pair from leaking across splits.
 
 For reportable results, evaluate a held-out CSV that was not passed to `train.py`. The evaluator
 checks the evaluation path against the dataset path stored in the checkpoint and writes a leakage
 warning when they match. Evaluating the training CSV remains useful as a diagnostic or smoke test,
 but does not measure generalization.
 
-The current CSV contract remains unchanged:
+The preferred CSV contract contains an explicit retain prompt:
 
 ```csv
-prompt,target
-"A jazz piece featuring bright trumpet and swung drums","trumpet"
+prompt,target,retain_prompt
+"A jazz piece featuring bright trumpet and swung drums","trumpet","A jazz piece featuring swung drums"
 ```
+
+Legacy `prompt,target` CSV files remain supported; in that case the retain prompt is derived by
+lexically removing the target. An explicit `retain_prompt` is always preferred.
 
 ## Smoke test
 
@@ -41,8 +57,8 @@ for checking that the machinery works; they are not comparable to a full 200-ste
 
 ```powershell
 uv run python scripts/evaluate.py `
-  --dataset datasets/trumpet_prompts_dataset.csv `
-  --checkpoint outputs/trumpet/steering_predictor_best.pt `
+  --dataset datasets/trumpet_simple_splits/validation.csv `
+  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
   --output outputs/eval-smoke `
   --max-samples 4 `
   --num-seeds 1 `
@@ -56,12 +72,15 @@ over a constant intervention:
 
 ```powershell
 uv run python scripts/evaluate.py `
-  --dataset datasets/trumpet_test.csv `
-  --checkpoint outputs/trumpet/steering_predictor_best.pt `
+  --dataset datasets/trumpet_simple_splits/test.csv `
+  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
   --output outputs/eval-final `
   --num-seeds 5 `
   --fixed-alphas 0.25 0.5 0.75 1.0
 ```
+
+Checkpoints created by the previous global-CFG steering formula are intentionally rejected: their
+`alpha` values have a different meaning and cannot be evaluated as full-to-retain interpolation.
 
 Generation settings default to those stored in the checkpoint and can be overridden with:
 
@@ -81,13 +100,14 @@ only when the named evaluation directory may be removed and recreated.
 For each generated waveform the evaluator records:
 
 - `target_similarity`: CLAP cosine similarity between audio and target; lower is better;
-- `retain_similarity`: CLAP cosine similarity between audio and the retain prompt, i.e. the prompt
-  with the target removed (`utils.strip_target`, also written to the `retain_prompt` column); higher
-  is better, and this is the term `scripts/train.py` optimizes alongside suppression;
+- `retain_similarity`: CLAP cosine similarity between audio and the explicit retain prompt, or the
+  fallback produced by `utils.strip_target` for legacy datasets; higher is better, and this is the
+  term `scripts/train.py` optimizes alongside suppression;
 - `prompt_similarity`: CLAP cosine similarity between audio and the full prompt;
 - RMS, peak, near-silence ratio and clipping ratio;
 - alpha mean, standard deviation, minimum and maximum;
-- fraction of steered steps with `alpha > 0.5`, where guidance is inverted.
+- fraction of steered steps with `alpha > 0.5`, where the interpolation weight assigned to
+  retain-prompt guidance is larger than the weight assigned to full-prompt guidance.
 
 Paired metrics compare a method with `base` for the same prompt and seed:
 
@@ -103,9 +123,9 @@ degraded rather than the concept removed.
 
 Prompt-similarity change is only a coarse fidelity proxy: in the current dataset the full prompt
 includes the target word `trumpet`, so suppressing the target and matching the full prompt are
-partially conflicting objectives. The retain prompt exists to remove that conflict, but its
-derivation is lexical, so modifiers of the target survive it (`"muted trumpet with a plunger mute"`
-becomes `"muted with a plunger mute"`) and a little target-adjacent meaning stays behind.
+partially conflicting objectives. Explicit retain prompts remove that conflict more cleanly. For
+legacy two-column datasets the fallback derivation is lexical, so modifiers of the target survive it
+(`"muted trumpet with a plunger mute"` becomes `"muted with a plunger mute"`).
 
 Confidence intervals use prompts as the independent units. Results from multiple seeds are averaged
 within each prompt before bootstrap resampling, avoiding artificially narrow intervals from treating
