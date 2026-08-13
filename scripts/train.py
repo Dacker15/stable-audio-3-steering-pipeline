@@ -1,5 +1,5 @@
 r"""
-Trains a `SteeringPredictor` to suppress a concept in `SteeringMusicLDMPipeline` generations.
+Trains a `SteeringPredictor` to suppress a concept in `SteeringStableAudioPipeline` generations.
 
 Each training step generates a full batch of waveforms with steering enabled, embeds them with the
 CLAP audio tower and scores them against two texts:
@@ -15,11 +15,12 @@ The retain term is what separates removing the concept from degrading the audio:
 are both far from the target, and only the retain term tells them apart from a faithful rendition of
 the rest of the prompt.
 
-Gradients reach the predictor because the pipeline is called with `output_type="latent"`: the
-`torch.no_grad()` in its post-processing block only stops new grad-tracking ops, it does not detach
-the latents, which are returned before any decoding happens. The UNet itself runs under `no_grad`,
-so the gradient flows to each `alpha_t` through the scheduler's linear recurrence only. That is a
-first-order approximation of the true gradient and is what keeps the unrolled trajectory affordable.
+Gradients reach the predictor because the pipeline is called with `output_type="latent"`, which
+returns the trajectory endpoint before any decoding happens, and because the pipeline reimplements
+Stable Audio 3's sampling loop without the `torch.no_grad()` the library applies to it. The
+diffusion transformer itself still runs under `no_grad`, so the gradient flows to each `alpha_t`
+through the Euler recurrence only. That is a first-order approximation of the true gradient and is
+what keeps the unrolled trajectory affordable.
 
 Example:
     uv run python scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv --batch-size 2 \
@@ -42,7 +43,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringMusicLDMPipeline, SteeringPredictor
+from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
 from utils import PromptTargetDataset, collate_prompt_target
 
 # static light-surface artifacts: chrome and ink from the reference palette, the first two
@@ -64,7 +65,7 @@ ORDINAL_BLUE = ("#86b6ef", "#3987e5", "#256abf", "#184f95", "#0d366b")
 def steered_step_indices(num_inference_steps: int, steering_frac_start: float, steering_frac_end: float) -> list[int]:
     r"""
     Returns the 0-based denoising-loop step indices where steering is active, mirroring the exact
-    condition evaluated in `SteeringMusicLDMPipeline.__call__`.
+    condition evaluated in `SteeringState.is_active`.
     """
     return [
         step
@@ -73,32 +74,24 @@ def steered_step_indices(num_inference_steps: int, steering_frac_start: float, s
     ]
 
 
-def mean_alpha_by_step(
-    records: list[tuple[float, float]],
-    num_inference_steps: int,
-    steering_frac_start: float,
-    steering_frac_end: float,
-) -> list[tuple[int, float]]:
+def mean_alpha_by_step(records: list[tuple[int, float]]) -> list[tuple[int, float]]:
     r"""
     Returns:
         `list[tuple[int, float]]`: `(step, mean_alpha)` pairs, one per denoising-loop step inside the
         steering window, ordered from `steering_frac_start` to `steering_frac_end`.
     """
-    totals: dict[float, float] = defaultdict(float)
-    counts: dict[float, int] = defaultdict(int)
-    for timestep, alpha in records:
-        totals[timestep] += alpha
-        counts[timestep] += 1
-    # raw timesteps decrease as the denoising loop advances, so sorting them from high to low
-    # recovers loop order and lines up positionally with `steered_step_indices`
-    means_in_loop_order = [totals[timestep] / counts[timestep] for timestep in sorted(totals, reverse=True)]
-    steps = steered_step_indices(num_inference_steps, steering_frac_start, steering_frac_end)
-    return list(zip(steps, means_in_loop_order, strict=True))
+    totals: dict[int, float] = defaultdict(float)
+    counts: dict[int, int] = defaultdict(int)
+    for step, alpha in records:
+        totals[step] += alpha
+        counts[step] += 1
+    # the pipeline records the loop step index directly, which already rises from noisy to clean
+    return [(step, totals[step] / counts[step]) for step in sorted(totals)]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a SteeringPredictor to suppress a concept in MusicLDM generations.",
+        description="Train a SteeringPredictor to suppress a concept in Stable Audio 3 generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -143,7 +136,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     generation = parser.add_argument_group("generation")
-    generation.add_argument("--num-inference-steps", type=int, default=200, help="denoising steps per generation")
+    generation.add_argument(
+        "--model",
+        type=str,
+        default="medium-base",
+        help="Stable Audio 3 checkpoint, has to be one of the `-base` ones because the post-trained ones ignore CFG",
+    )
+    generation.add_argument("--num-inference-steps", type=int, default=50, help="denoising steps per generation")
     generation.add_argument(
         "--audio-length-in-s",
         type=float,
@@ -153,10 +152,24 @@ def parse_args() -> argparse.Namespace:
             " scored and nothing is generated that the loss cannot see"
         ),
     )
-    generation.add_argument("--guidance-scale", type=float, default=2.0, help="must exceed 1.0 to enable steering")
+    generation.add_argument("--cfg-scale", type=float, default=7.0, help="must exceed 1.0 to enable steering")
+    generation.add_argument(
+        "--apg-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "0.0 is plain classifier free guidance, 1.0 is Stable Audio 3's own adaptive projected guidance."
+            " alpha_t interpolates between two guidance predictions, so the plain one is the default here"
+        ),
+    )
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--seed", type=int, default=42)
+    runtime.add_argument(
+        "--no-half",
+        action="store_true",
+        help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
+    )
 
     args = parser.parse_args()
 
@@ -182,12 +195,19 @@ def parse_args() -> argparse.Namespace:
             "`--steering-frac-start` and `--steering-frac-end` have to satisfy"
             f" `0.0 <= start < end <= 1.0` but are {args.steering_frac_start} and {args.steering_frac_end}"
         )
-    if args.guidance_scale <= 1.0:
-        # the pipeline only calls the steering model inside its classifier free guidance branch
+    if args.cfg_scale <= 1.0:
+        # the transformer only calls the steering model inside its classifier free guidance branch
         raise ValueError(
-            f"`--guidance-scale` has to be greater than 1.0 for steering to be applied but is {args.guidance_scale}."
-            " With a lower value the pipeline skips classifier free guidance and never calls the steering model, so"
-            " the predictor would receive no gradient."
+            f"`--cfg-scale` has to be greater than 1.0 for steering to be applied but is {args.cfg_scale}."
+            " With a lower value Stable Audio 3 skips classifier free guidance and never calls the steering model,"
+            " so the predictor would receive no gradient."
+        )
+    if not 0.0 <= args.apg_scale <= 1.0:
+        raise ValueError(f"`--apg-scale` has to be in [0.0, 1.0] but is {args.apg_scale}")
+    if not args.model.endswith("-base"):
+        raise ValueError(
+            f"`--model` has to be a `-base` checkpoint but is {args.model!r}. The post-trained checkpoints are"
+            " distilled and ignore classifier free guidance, which is where steering is applied."
         )
 
     num_steered_steps = len(
@@ -310,8 +330,8 @@ def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: 
 
     The x-axis is the 0-based step index inside the steering window: `steering_frac_start` maps to
     the lowest step plotted and `steering_frac_end` to the highest, matching the condition evaluated
-    in `SteeringMusicLDMPipeline.__call__`. Step index rises from noisy to clean as the loop advances,
-    so, unlike a raw-timestep axis, it needs no inversion to read left to right.
+    in `SteeringState.is_active`. Step index rises from noisy to clean as the loop advances, so,
+    unlike a raw-timestep axis, it needs no inversion to read left to right.
 
     Epochs are an ordered quantity, so the lines use a single-hue ordinal ramp rather than
     categorical hues. At most `len(ORDINAL_BLUE)` epochs are drawn, evenly spaced and always
@@ -394,32 +414,36 @@ def main() -> None:
     _, example_target, example_retain = dataset.rows[0]
     print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
 
-    # float32 throughout: the gradient reaches `alpha_t` through the scheduler recurrence, the VAE,
-    # the vocoder and the CLAP tower, and in half precision that chain returns a gradient whose sign
-    # disagrees with a finite-difference check of the same loss more often than not
-    pipe = SteeringMusicLDMPipeline.from_pretrained("ucsd-reach/musicldm", torch_dtype=torch.float32).to(device)
-    pipe.set_progress_bar_config(disable=True)
-    for module in (pipe.unet, pipe.vae, pipe.vocoder, pipe.text_encoder):
-        module.requires_grad_(False)
-        module.eval()
+    # The latent trajectory, the guidance algebra and the autoencoder stay in float32 whatever the
+    # transformer runs in: the gradient reaches `alpha_t` through the Euler recurrence, the decoder
+    # and the CLAP tower, and in half precision that chain returns a gradient whose sign disagrees
+    # with a finite-difference check of the same loss more often than not.
+    print(f"Loading {args.model} on {device} with {'float32' if args.no_half else 'half'} precision")
+    pipe = SteeringStableAudioPipeline.from_pretrained(args.model, device=device, model_half=not args.no_half)
+    pipe.diffusion.requires_grad_(False)
+    pipe.diffusion.eval()
 
     # the predictor casts its inputs and its output to the latents' dtype itself, so it keeps
-    # working unchanged if the pipeline above is ever loaded in half precision again
+    # working unchanged whichever precision the transformer above was loaded in
     predictor_config = {
-        "latent_channels": pipe.unet.config.in_channels,
-        "target_embed_dim": pipe.text_encoder.config.projection_dim,
+        "latent_channels": pipe.io_channels,
+        "target_embed_dim": None,  # filled in below, once CLAP is loaded
         "alpha_min": args.alpha_min,
         "alpha_max": args.alpha_max,
         "alpha_init": args.alpha_init,
     }
+
+    # Stable Audio 3 conditions on T5Gemma, so CLAP is loaded on its own. It scores the loss and
+    # also provides the `target_embed` the predictor is conditioned on, which keeps both in one space
+    clap_loss = ClapLoss.from_pretrained().to(device)
+    predictor_config["target_embed_dim"] = clap_loss.embed_dim
+
     predictor = SteeringPredictor(**predictor_config).to(device)
     num_parameters = sum(parameter.numel() for parameter in predictor.parameters())
     print(f"SteeringPredictor: {num_parameters / 1e6:.2f}M parameters, config {predictor_config}")
 
-    clap_loss = ClapLoss(pipe.text_encoder, pipe.tokenizer, pipe.feature_extractor).to(device)
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    num_samples = int(args.audio_length_in_s * pipe.vocoder.config.sampling_rate)
     print(
         f"Steering {args.num_steered_steps}/{args.num_inference_steps} steps in"
         f" [{args.steering_frac_start}, {args.steering_frac_end}), {args.audio_length_in_s}s clips"
@@ -436,7 +460,7 @@ def main() -> None:
         epoch_losses: list[float] = []
         epoch_target_similarities: list[float] = []
         epoch_retain_similarities: list[float] = []
-        epoch_alpha_records: list[tuple[float, float]] = []
+        epoch_alpha_records: list[tuple[int, float]] = []
 
         for batch_index, (prompts, targets, retains) in enumerate(dataloader):
             step += 1
@@ -446,29 +470,30 @@ def main() -> None:
             output = pipe(
                 prompt=prompts,
                 retain_prompt=retains,
-                steering_target=targets,
+                target_embed=clap_loss.encode_text(targets),
                 steering_model=predictor,
                 steering_frac_start=args.steering_frac_start,
                 steering_frac_end=args.steering_frac_end,
                 train=True,
                 num_inference_steps=args.num_inference_steps,
                 audio_length_in_s=args.audio_length_in_s,
-                guidance_scale=args.guidance_scale,
-                num_waveforms_per_prompt=1,
+                cfg_scale=args.cfg_scale,
+                apg_scale=args.apg_scale,
                 generator=generator,
                 output_type="latent",
             )
             latents = output.audios
             epoch_alpha_records.extend(output.alpha_records)
 
-            # mirrors the pipeline's post-processing, but outside `no_grad` and without the move to
-            # the CPU that `mel_spectrogram_to_waveform` performs
-            mel_spectrogram = pipe.vae.decode(latents / pipe.vae.config.scaling_factor).sample
-            if mel_spectrogram.dim() == 4:
-                mel_spectrogram = mel_spectrogram.squeeze(1)
-            waveform = pipe.vocoder(mel_spectrogram)[:, :num_samples]
+            # the pipeline's own post-processing, minus the clamp, which would zero the gradient of
+            # every saturated sample
+            waveform = pipe.decode_latents(
+                latents, padding_mask=output.padding_mask, audio_length_in_s=args.audio_length_in_s
+            )
 
-            audio_embeds = clap_loss.encode_audio(waveform, pipe.vocoder.config.sampling_rate)
+            # Stable Audio 3 is stereo while CLAP's audio tower is mono, so the channels are summed
+            # to a single mid signal before scoring
+            audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
 
             # `ClapLoss` returns `1 - cosine_similarity`, so negating it maximizes the distance to
             # the target, i.e. suppresses the concept the prompt asks for
@@ -528,9 +553,7 @@ def main() -> None:
                 "loss": epoch_loss,
                 "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
                 "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
-                "alpha_by_step": mean_alpha_by_step(
-                    epoch_alpha_records, args.num_inference_steps, args.steering_frac_start, args.steering_frac_end
-                ),
+                "alpha_by_step": mean_alpha_by_step(epoch_alpha_records),
             }
         )
         print(f"epoch {epoch}/{args.epochs} mean loss {epoch_loss:+.4f}")
@@ -539,6 +562,7 @@ def main() -> None:
             "state_dict": predictor.state_dict(),
             "config": predictor_config,
             "steering_mode": STEERING_MODE,
+            "model": args.model,
             "args": history["args"],
             "epoch": epoch,
             "loss": epoch_loss,

@@ -12,10 +12,10 @@ resolution-markers = [
 
 [manifest]
 overrides = [
-    { name = "torch", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchaudio", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchaudio", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torch", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchaudio", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchaudio", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu130" },
 ]
 
 [[package]]
@@ -854,42 +854,6 @@ wheels = [
 ]
 
 [[package]]
-name = "musicldm-steering-pipeline"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "accelerate" },
-    { name = "diffusers" },
-    { name = "matplotlib" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "stable-audio-3" },
-    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'win32')" },
-    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "torchaudio", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torchaudio", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'win32')" },
-    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "torchsde" },
-    { name = "transformers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "accelerate", specifier = ">=1.14.0" },
-    { name = "diffusers", specifier = ">=0.39.0" },
-    { name = "matplotlib", specifier = ">=3.11.1" },
-    { name = "numpy", specifier = ">=2.4.6" },
-    { name = "stable-audio-3", git = "https://github.com/Stability-AI/stable-audio-3" },
-    { name = "torch", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchaudio", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torchaudio", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "torchsde", specifier = ">=0.2.6" },
-    { name = "transformers", specifier = ">=5.14.1" },
-]
-
-[[package]]
 name = "networkx"
 version = "3.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1612,6 +1576,52 @@ dependencies = [
     { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "tqdm" },
     { name = "transformers" },
+]
+
+[[package]]
+name = "stable-audio-3-steering-pipeline"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "accelerate" },
+    { name = "diffusers" },
+    { name = "einops" },
+    { name = "huggingface-hub" },
+    { name = "matplotlib" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "safetensors" },
+    { name = "soundfile" },
+    { name = "stable-audio-3" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'win32')" },
+    { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "torchaudio", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
+    { name = "torchaudio", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'AMD64' and sys_platform == 'win32') or (sys_platform != 'darwin' and sys_platform != 'win32')" },
+    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "torchsde" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "accelerate", specifier = ">=1.14.0" },
+    { name = "diffusers", specifier = ">=0.39.0" },
+    { name = "einops", specifier = ">=0.8.2" },
+    { name = "huggingface-hub", specifier = ">=1.7.1" },
+    { name = "matplotlib", specifier = ">=3.11.1" },
+    { name = "numpy", specifier = ">=2.4.6" },
+    { name = "safetensors", specifier = ">=0.7.0" },
+    { name = "soundfile", specifier = ">=0.13.1" },
+    { name = "stable-audio-3", git = "https://github.com/Stability-AI/stable-audio-3" },
+    { name = "torch", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchaudio", marker = "platform_machine != 'AMD64' or sys_platform != 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchaudio", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "torchsde", specifier = ">=0.2.6" },
+    { name = "tqdm", specifier = ">=4.67.3" },
+    { name = "transformers", specifier = ">=5.14.1" },
 ]
 
 [[package]]

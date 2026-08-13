@@ -1,18 +1,26 @@
 [project]
-name = "musicldm-steering-pipeline"
+name = "stable-audio-3-steering-pipeline"
 version = "0.1.0"
-description = "Add your description here"
+description = "Learned per-step concept steering for Stable Audio 3, by interpolating between full-prompt and retain-prompt classifier free guidance"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.14.0",
+    # only `scripts/generate_audio.py` (the MusicLDM baseline) and
+    # `scripts/generate_audio_stable_audio.py` (Stable Audio Open 1.0) still use diffusers; Stable
+    # Audio 3 is not supported by it and ships its own library instead
     "diffusers>=0.39.0",
+    "einops>=0.8.2",
+    "huggingface-hub>=1.7.1",
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
+    "safetensors>=0.7.0",
+    "soundfile>=0.13.1",
     "stable-audio-3",
-    "torch>=2.3.0",
-    "torchaudio>=2.3.0",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
     "torchsde>=0.2.6",
+    "tqdm>=4.67.3",
     "transformers>=5.14.1",
 ]
 
@@ -44,8 +52,10 @@ torchvision = [
 
 [tool.uv]
 # `stable-audio-3` pins `torch==2.7.1` and `torchaudio==2.7.1`, which are not published on the cu130
-# index this project builds against, so the pins are relaxed back to the project's own bounds.
-override-dependencies = ["torch>=2.3.0", "torchaudio>=2.3.0"]
+# index this project builds against, so the pins are relaxed back to the project's own bounds. The
+# steering pipeline runs the Stable Audio 3 diffusion transformer on a GPU, so the CUDA build is the
+# one that matters here.
+override-dependencies = ["torch>=2.7.1", "torchaudio>=2.7.1"]
 
 [build-system]
 requires = ["hatchling"]

@@ -1,5 +1,5 @@
 r"""
-Evaluates a trained ``SteeringPredictor`` against the unsteered MusicLDM baseline.
+Evaluates a trained ``SteeringPredictor`` against the unsteered Stable Audio 3 baseline.
 
 Example smoke test (using a checkpoint produced by ``scripts/train.py``):
 
@@ -20,10 +20,8 @@ Example final run with fixed-alpha controls:
 import argparse
 import csv
 import json
-import math
 import shutil
 import warnings
-import wave
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -33,15 +31,16 @@ import torch
 from torch import nn
 
 from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringMusicLDMPipeline, SteeringPredictor
-from utils import PromptTargetDataset
+from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
+from utils import PromptTargetDataset, save_waveform
 
 
-MODEL_ID = "ucsd-reach/musicldm"
+MODEL = "medium-base"
 FALLBACK_GENERATION_CONFIG = {
-    "num_inference_steps": 200,
-    "audio_length_in_s": 5.0,
-    "guidance_scale": 2.0,
+    "num_inference_steps": 50,
+    "audio_length_in_s": 10.0,
+    "cfg_scale": 7.0,
+    "apg_scale": 0.0,
     "steering_frac_start": 0.3,
     "steering_frac_end": 0.8,
 }
@@ -89,7 +88,7 @@ class FixedAlphaSteering(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a SteeringPredictor with paired MusicLDM generations.",
+        description="Evaluate a SteeringPredictor with paired Stable Audio 3 generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -120,18 +119,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     generation = parser.add_argument_group("generation")
-    generation.add_argument("--model-id", default=MODEL_ID)
+    generation.add_argument("--model", default=None, help="Stable Audio 3 `-base` checkpoint, defaults to the one trained against")
     generation.add_argument("--num-seeds", type=int, default=1, help="independent noises generated per prompt")
     generation.add_argument("--seed", type=int, default=1000, help="first evaluation seed")
     generation.add_argument("--num-inference-steps", type=int, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--audio-length-in-s", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--guidance-scale", type=float, default=None, help="defaults to checkpoint setting")
+    generation.add_argument("--cfg-scale", type=float, default=None, help="defaults to checkpoint setting")
+    generation.add_argument("--apg-scale", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--steering-frac-start", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--steering-frac-end", type=float, default=None, help="defaults to checkpoint setting")
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    runtime.add_argument("--dtype", choices=("auto", "float16", "float32"), default="auto")
+    runtime.add_argument(
+        "--no-half",
+        action="store_true",
+        help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
+    )
     runtime.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=True)
     runtime.add_argument("--bootstrap-samples", type=int, default=10_000)
     runtime.add_argument("--silence-threshold", type=float, default=1e-4)
@@ -160,15 +164,17 @@ def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -
         resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
 
     resolved["num_inference_steps"] = int(resolved["num_inference_steps"])
-    for name in ("audio_length_in_s", "guidance_scale", "steering_frac_start", "steering_frac_end"):
+    for name in ("audio_length_in_s", "cfg_scale", "apg_scale", "steering_frac_start", "steering_frac_end"):
         resolved[name] = float(resolved[name])
 
     if resolved["num_inference_steps"] < 1:
         raise ValueError("num_inference_steps must be at least 1")
     if resolved["audio_length_in_s"] <= 0.0:
         raise ValueError("audio_length_in_s must be positive")
-    if resolved["guidance_scale"] <= 1.0:
-        raise ValueError("guidance_scale must exceed 1.0 because steering is applied inside the CFG branch")
+    if resolved["cfg_scale"] <= 1.0:
+        raise ValueError("cfg_scale must exceed 1.0 because steering is applied inside the CFG branch")
+    if not 0.0 <= resolved["apg_scale"] <= 1.0:
+        raise ValueError("apg_scale must be in [0.0, 1.0]")
     start = resolved["steering_frac_start"]
     end = resolved["steering_frac_end"]
     if not 0.0 <= start < end <= 1.0:
@@ -184,21 +190,13 @@ def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -
     return resolved
 
 
-def resolve_device_and_dtype(device_arg: str, dtype_arg: str) -> tuple[torch.device, torch.dtype]:
+def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device_arg)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_arg)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is not available")
-
-    if dtype_arg == "auto":
-        dtype = torch.float16 if device.type == "cuda" else torch.float32
-    else:
-        dtype = getattr(torch, dtype_arg)
-    if device.type == "cpu" and dtype == torch.float16:
-        warnings.warn("float16 on CPU is often unsupported or very slow; float32 is recommended", stacklevel=2)
-    return device, dtype
+    return device
 
 
 def prepare_output_directory(path: Path, replace: bool) -> Path:
@@ -222,7 +220,12 @@ def fixed_alpha_name(alpha: float) -> str:
 
 
 def waveform_metrics(waveform: np.ndarray, silence_threshold: float, clipping_threshold: float) -> dict[str, float]:
-    waveform = np.asarray(waveform, dtype=np.float64).reshape(-1)
+    """Signal sanity checks. Stereo input is downmixed first, so silence is silence in both channels."""
+
+    waveform = np.asarray(waveform, dtype=np.float64)
+    if waveform.ndim == 2:
+        waveform = waveform.mean(axis=0)
+    waveform = waveform.reshape(-1)
     if waveform.size == 0:
         raise ValueError("generated waveform is empty")
     if not np.isfinite(waveform).all():
@@ -253,18 +256,6 @@ def alpha_metrics(records: list[tuple[float, float]]) -> dict[str, float | None]
         "alpha_max": float(values.max()),
         "retain_dominant_ratio": float(np.mean(values > 0.5)),
     }
-
-
-def save_waveform(path: Path, waveform: np.ndarray, sampling_rate: int) -> None:
-    """Writes mono float audio as clipped signed 16-bit PCM using only the standard library."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pcm = np.round(np.clip(np.asarray(waveform), -1.0, 1.0) * 32767.0).astype("<i2")
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sampling_rate)
-        wav_file.writeframes(pcm.tobytes())
 
 
 def _mean_ci_by_prompt(
@@ -405,21 +396,21 @@ def plot_tradeoff(summary: dict, path: Path) -> None:
 
 
 def plot_alpha_schedules(alpha_runs: list[dict], path: Path) -> None:
-    grouped: dict[str, dict[float, list[float]]] = defaultdict(lambda: defaultdict(list))
+    grouped: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
     for run in alpha_runs:
-        for timestep, alpha in run["records"]:
-            grouped[run["method"]][float(timestep)].append(float(alpha))
+        for step, alpha in run["records"]:
+            grouped[run["method"]][int(step)].append(float(alpha))
     if not grouped:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for index, (method, by_timestep) in enumerate(grouped.items()):
-        timesteps = sorted(by_timestep, reverse=True)
-        values = [float(np.mean(by_timestep[timestep])) for timestep in timesteps]
-        ax.plot(timesteps, values, label=method, color=PLOT_COLORS[index % len(PLOT_COLORS)], linewidth=2)
+    for index, (method, by_step) in enumerate(grouped.items()):
+        # the pipeline records the loop step index, which already rises from noisy to clean
+        steps = sorted(by_step)
+        values = [float(np.mean(by_step[step])) for step in steps]
+        ax.plot(steps, values, label=method, color=PLOT_COLORS[index % len(PLOT_COLORS)], linewidth=2)
     ax.axhline(0.5, color="#999999", linewidth=1, linestyle="--", label="full/retain midpoint")
-    ax.invert_xaxis()
-    ax.set_xlabel("Denoising timestep (noisy to clean)")
+    ax.set_xlabel("Denoising step (noisy to clean)")
     ax.set_ylabel("Mean alpha")
     ax.set_title("Steering schedules")
     ax.grid(alpha=0.25)
@@ -527,7 +518,8 @@ def main() -> None:
     if checkpoint["steering_mode"] != STEERING_MODE:
         raise ValueError(
             f"checkpoint {args.checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but this evaluator"
-            f" requires {STEERING_MODE!r}"
+            f" requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be evaluated on Stable Audio 3:"
+            " the two backbones do not share a latent space."
         )
     checkpoint_args = checkpoint.get("args", {})
     generation_config = resolve_generation_config(args, checkpoint_args)
@@ -542,7 +534,8 @@ def main() -> None:
             )
 
     dataset = PromptTargetDataset(args.dataset, args.max_samples)
-    device, dtype = resolve_device_and_dtype(args.device, args.dtype)
+    device = resolve_device(args.device)
+    model_name = args.model or checkpoint.get("model") or MODEL
     same_dataset = _same_dataset_as_training(args.dataset, checkpoint_args)
     if same_dataset:
         warnings.warn(
@@ -555,14 +548,14 @@ def main() -> None:
         "dataset": str(args.dataset.resolve()),
         "checkpoint": str(args.checkpoint.resolve()),
         "output": str(output_dir),
-        "model_id": args.model_id,
+        "model": model_name,
         "num_prompts": len(dataset),
         "num_seeds": args.num_seeds,
         "first_seed": args.seed,
         "target_counts": dict(Counter(target for _, target, _ in dataset.rows)),
         "same_dataset_as_training": same_dataset,
         "device": str(device),
-        "dtype": str(dtype),
+        "model_half": not args.no_half,
         "fixed_alphas": args.fixed_alphas,
         "save_audio": args.save_audio,
         "silence_threshold": args.silence_threshold,
@@ -575,12 +568,10 @@ def main() -> None:
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    print(f"Loading {args.model_id} on {device} with {dtype}")
-    pipe = SteeringMusicLDMPipeline.from_pretrained(args.model_id, torch_dtype=dtype).to(device)
-    pipe.set_progress_bar_config(disable=True)
-    for module in (pipe.unet, pipe.vae, pipe.vocoder, pipe.text_encoder):
-        module.requires_grad_(False)
-        module.eval()
+    print(f"Loading {model_name} on {device} with {'float32' if args.no_half else 'half'} precision")
+    pipe = SteeringStableAudioPipeline.from_pretrained(model_name, device=device, model_half=not args.no_half)
+    pipe.diffusion.requires_grad_(False)
+    pipe.diffusion.eval()
 
     predictor = SteeringPredictor(**predictor_config).to(device)
     predictor.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -597,8 +588,12 @@ def main() -> None:
             raise ValueError(f"duplicate evaluation method {name}; remove repeated fixed alphas")
         methods[name] = FixedAlphaSteering(alpha).to(device)
 
-    clap = ClapLoss(pipe.text_encoder, pipe.tokenizer, pipe.feature_extractor, reduction="none").to(device)
-    sampling_rate = int(pipe.vocoder.config.sampling_rate)
+    clap = ClapLoss.from_pretrained(reduction="none").to(device)
+    sampling_rate = pipe.sample_rate
+
+    # the predictor is conditioned on the CLAP embedding of the target, and the dataset holds far
+    # fewer distinct targets than rows, so they are embedded once up front
+    target_embeds = {target: clap.encode_text([target]) for target in {row[1] for row in dataset.rows}}
 
     rows: list[dict] = []
     alpha_runs: list[dict] = []
@@ -625,32 +620,29 @@ def main() -> None:
                         output = pipe(
                             prompt=prompt,
                             retain_prompt=retain_prompt,
-                            steering_target=target,
+                            target_embed=target_embeds[target],
                             steering_model=steering_model,
                             steering_frac_start=generation_config["steering_frac_start"],
                             steering_frac_end=generation_config["steering_frac_end"],
                             train=False,
                             num_inference_steps=generation_config["num_inference_steps"],
                             audio_length_in_s=generation_config["audio_length_in_s"],
-                            guidance_scale=generation_config["guidance_scale"],
-                            num_waveforms_per_prompt=1,
+                            cfg_scale=generation_config["cfg_scale"],
+                            apg_scale=generation_config["apg_scale"],
                             generator=generator,
                             output_type="pt",
                         )
-                        waveform_tensor = output.audios
-                        if not torch.is_tensor(waveform_tensor):
-                            waveform_tensor = torch.as_tensor(waveform_tensor)
-                        if waveform_tensor.ndim == 1:
-                            waveform_tensor = waveform_tensor.unsqueeze(0)
-                        waveform_for_clap = waveform_tensor.to(device)
-                        audio_embeds = clap.encode_audio(waveform_for_clap, sampling_rate)
+                        # `(1, channels, samples)`; CLAP's audio tower is mono, so the channels are
+                        # summed to a mid signal for scoring while the saved file stays stereo
+                        waveform_tensor = output.audios.to(device)
+                        audio_embeds = clap.encode_audio(waveform_tensor.mean(dim=1), sampling_rate)
                         target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
                         prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
                         retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
 
                     waveform = waveform_tensor[0].detach().float().cpu().numpy()
                     signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
-                    records = [(float(timestep), float(alpha)) for timestep, alpha in output.alpha_records]
+                    records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
                     alpha_stats = alpha_metrics(records)
 
                     audio_relative_path = ""

@@ -52,8 +52,8 @@ lexically removing the target. An explicit `retain_prompt` is always preferred.
 
 ## Smoke test
 
-This checks the end-to-end evaluator with a small workload. Twenty denoising steps are useful only
-for checking that the machinery works; they are not comparable to a full 200-step evaluation.
+This checks the end-to-end evaluator with a small workload. Eight denoising steps are useful only
+for checking that the machinery works; they are not comparable to a full 50-step evaluation.
 
 ```powershell
 uv run python scripts/evaluate.py `
@@ -62,7 +62,7 @@ uv run python scripts/evaluate.py `
   --output outputs/eval-smoke `
   --max-samples 4 `
   --num-seeds 1 `
-  --num-inference-steps 20
+  --num-inference-steps 8
 ```
 
 ## Final paired evaluation
@@ -79,18 +79,22 @@ uv run python scripts/evaluate.py `
   --fixed-alphas 0.25 0.5 0.75 1.0
 ```
 
-Checkpoints created by the previous global-CFG steering formula are intentionally rejected: their
-`alpha` values have a different meaning and cannot be evaluated as full-to-retain interpolation.
+Checkpoints whose `steering_mode` does not match the evaluator's are intentionally rejected. That
+covers the previous global-CFG formula, whose `alpha` values have a different meaning, and every
+checkpoint trained against MusicLDM, which does not share a latent space with Stable Audio 3.
 
 Generation settings default to those stored in the checkpoint and can be overridden with:
 
+- `--model`, which has to name a `-base` checkpoint;
 - `--num-inference-steps`;
 - `--audio-length-in-s`;
-- `--guidance-scale`;
+- `--cfg-scale` and `--apg-scale`;
 - `--steering-frac-start` and `--steering-frac-end`.
 
-On CUDA, dtype `auto` uses float16. On CPU it uses float32. Audio saving can be disabled with
-`--no-save-audio`, although paired listening is strongly recommended.
+The diffusion transformer is loaded in half precision unless `--no-half` is passed; the latent
+trajectory, the guidance algebra and the autoencoder are always float32. Audio saving can be disabled
+with `--no-save-audio`, although paired listening is strongly recommended. Saved clips are stereo at
+44.1 kHz; CLAP scores a mono downmix of them, since its audio tower is mono.
 
 An existing non-empty output directory is never replaced accidentally. Pass `--replace-output`
 only when the named evaluation directory may be removed and recreated.

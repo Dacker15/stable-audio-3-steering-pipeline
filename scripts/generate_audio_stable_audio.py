@@ -1,7 +1,7 @@
 r"""
 Generates audio with the stock `StableAudioPipeline` for a list of prompts.
 
-Unlike `scripts/train.py` and `scripts/evaluate.py`, this script never touches MusicLDM or any
+Unlike `scripts/train.py` and `scripts/evaluate.py`, this script never touches any
 steering component: there is no steering target, predictor or steering window, just plain
 text-to-audio generation with Stable Audio Open.
 
@@ -18,12 +18,12 @@ Example, prompts read from a CSV file with a `prompt` column:
 import argparse
 import csv
 import json
-import wave
 from pathlib import Path
 
-import numpy as np
 import torch
 from diffusers import StableAudioPipeline
+
+from utils import save_waveform
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,19 +86,6 @@ def resolve_device_and_dtype() -> tuple[torch.device, torch.dtype]:
     dtype = torch.float32
 
     return device, dtype
-
-
-def save_waveform(path: Path, waveform: np.ndarray, sampling_rate: int) -> None:
-    """Writes float audio of shape `(channels, samples)` as clipped signed 16-bit PCM, stdlib only."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pcm = np.round(np.clip(np.asarray(waveform), -1.0, 1.0) * 32767.0).astype("<i2")
-    frames = np.ascontiguousarray(pcm.T)  # (samples, channels), interleaved for wave's frame layout
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(pcm.shape[0])
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sampling_rate)
-        wav_file.writeframes(frames.tobytes())
 
 
 def main() -> None:

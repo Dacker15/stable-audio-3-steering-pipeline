@@ -3,12 +3,12 @@ import math
 import unittest
 
 
-if importlib.util.find_spec("torch") is None or importlib.util.find_spec("diffusers") is None:
-    raise unittest.SkipTest("PyTorch and diffusers are required for steering runtime tests")
+if importlib.util.find_spec("torch") is None or importlib.util.find_spec("stable_audio_3") is None:
+    raise unittest.SkipTest("PyTorch and stable_audio_3 are required for steering runtime tests")
 
 import torch
 
-from pipelines import SteeringMusicLDMPipeline, SteeringPredictor
+from pipelines import SteeringDiffusionTransformer, SteeringPredictor, SteeringStableAudioPipeline
 
 
 class TargetSpecificSteeringTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class TargetSpecificSteeringTests(unittest.TestCase):
         retain = torch.tensor([5.0])
 
         outputs = [
-            SteeringMusicLDMPipeline._interpolate_cfg_predictions(
+            SteeringDiffusionTransformer._interpolate_cfg_predictions(
                 uncond, full, retain, guidance_scale=2.0, alpha_t=torch.tensor([alpha])
             )
             for alpha in (0.0, 0.5, 1.0)
@@ -28,15 +28,34 @@ class TargetSpecificSteeringTests(unittest.TestCase):
         self.assertTrue(torch.equal(outputs[1], torch.tensor([7.0])))
         self.assertTrue(torch.equal(outputs[2], torch.tensor([9.0])))
 
+    def test_projected_guidance_differences_are_used_when_given(self) -> None:
+        r"""With adaptive projected guidance the pipeline substitutes its own difference terms."""
+        uncond = torch.tensor([1.0])
+        full = torch.tensor([3.0])
+        retain = torch.tensor([5.0])
+
+        output = SteeringDiffusionTransformer._interpolate_cfg_predictions(
+            uncond,
+            full,
+            retain,
+            guidance_scale=2.0,
+            alpha_t=torch.tensor([0.0]),
+            cfg_diff_full=torch.tensor([0.0]),
+            cfg_diff_retain=torch.tensor([0.0]),
+        )
+
+        # a zero difference collapses guidance onto the conditional prediction itself
+        self.assertTrue(torch.equal(output, full))
+
     def test_retain_prompt_validation_and_batch_expansion(self) -> None:
         self.assertEqual(
-            SteeringMusicLDMPipeline._prepare_retain_prompt("  drums and piano  ", 2),
+            SteeringStableAudioPipeline._prepare_retain_prompt("  drums and piano  ", 2),
             ["drums and piano", "drums and piano"],
         )
         with self.assertRaisesRegex(ValueError, "non-empty string"):
-            SteeringMusicLDMPipeline._prepare_retain_prompt(["drums", "  "], 2)
+            SteeringStableAudioPipeline._prepare_retain_prompt(["drums", "  "], 2)
         with self.assertRaisesRegex(ValueError, "batch size"):
-            SteeringMusicLDMPipeline._prepare_retain_prompt(["drums"], 2)
+            SteeringStableAudioPipeline._prepare_retain_prompt(["drums"], 2)
 
     def test_default_alpha_bias_is_fifteen_percent_of_range(self) -> None:
         predictor = SteeringPredictor(
@@ -50,6 +69,26 @@ class TargetSpecificSteeringTests(unittest.TestCase):
         )
         initialized_alpha = torch.sigmoid(predictor.head[-1].bias).item()
         self.assertTrue(math.isclose(initialized_alpha, 0.15, rel_tol=0.0, abs_tol=1e-6))
+
+    def test_predictor_accepts_a_singleton_height_axis(self) -> None:
+        r"""
+        Stable Audio 3's latents are `(batch, channels, frames)`; the pipeline adds the height axis
+        the encoder needs, so the predictor has to survive a height of 1 through every downsample.
+        """
+        predictor = SteeringPredictor(
+            latent_channels=4,
+            target_embed_dim=3,
+            block_out_channels=(4, 8),
+            layers_per_block=1,
+            cond_embed_dim=8,
+            num_attention_heads=2,
+            norm_num_groups=1,
+        )
+        latents = torch.randn(2, 4, 1, 17)
+        alpha = predictor(latents=latents, t=torch.tensor([500.0]), target_embed=torch.randn(2, 3))
+
+        self.assertEqual(alpha.shape, (2, 1, 1, 1))
+        self.assertTrue(torch.all((alpha >= 0.0) & (alpha <= 1.0)))
 
 
 if __name__ == "__main__":

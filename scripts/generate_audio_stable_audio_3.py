@@ -3,8 +3,9 @@ Generates audio with Stable Audio 3 for a list of prompts.
 
 Same job as `scripts/generate_audio_stable_audio.py`, but Stable Audio 3 is not supported by diffusers:
 it ships its own library, `stable_audio_3`, whose `StableAudioModel` replaces `StableAudioPipeline`. Like
-the other generation scripts this one never touches MusicLDM or any steering component, it is plain
-text-to-audio generation.
+the other generation scripts this one never touches any steering component, it is plain text-to-audio
+generation, which makes it the unsteered reference `scripts/evaluate.py` results can be sanity-checked
+against.
 
 The `stabilityai/stable-audio-3-*` weights are gated: accept the Stability AI Community License and the
 Gemma Terms of Use on the model page, then authenticate with `hf auth login` or an `HF_TOKEN` variable.
@@ -26,11 +27,11 @@ Example, prompts read from a CSV file with a `prompt` column:
 import argparse
 import csv
 import json
-import wave
 from pathlib import Path
 
-import numpy as np
 from stable_audio_3 import StableAudioModel
+
+from utils import save_waveform
 
 # Post-trained checkpoints are distilled: 8 steps are enough and they ignore guidance, while the `-base`
 # ones keep classifier free guidance and want roughly 50 steps. The values are the model's maximum duration.
@@ -106,19 +107,6 @@ def load_prompts_from_csv(path: Path) -> list[str]:
     if not prompts:
         raise ValueError(f"`dataset` has to contain at least one non-empty prompt but {path} contains none")
     return prompts
-
-
-def save_waveform(path: Path, waveform: np.ndarray, sampling_rate: int) -> None:
-    """Writes float audio of shape `(channels, samples)` as clipped signed 16-bit PCM, stdlib only."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pcm = np.round(np.clip(np.asarray(waveform), -1.0, 1.0) * 32767.0).astype("<i2")
-    frames = np.ascontiguousarray(pcm.T)  # (samples, channels), interleaved for wave's frame layout
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(pcm.shape[0])
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sampling_rate)
-        wav_file.writeframes(frames.tobytes())
 
 
 def main() -> None:

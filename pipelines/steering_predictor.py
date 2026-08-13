@@ -119,7 +119,7 @@ class SelfAttentionBlock2D(nn.Module):
 
 class SteeringPredictor(nn.Module):
     r"""
-    Predicts the per-step steering strength `alpha_t` consumed by `SteeringMusicLDMPipeline`.
+    Predicts the per-step steering strength `alpha_t` consumed by `SteeringStableAudioPipeline`.
 
     The pipeline uses `alpha_t` to interpolate between classifier-free guidance for the full prompt
     and classifier-free guidance for the retain prompt. With the default range, `alpha_t = 0`
@@ -136,11 +136,12 @@ class SteeringPredictor(nn.Module):
     information is lost.
 
     Args:
-        latent_channels (`int`, *optional*, defaults to 8): Number of latent channels, i.e. `unet.config.in_channels`
-            of the pipeline. The spatial size of the latents is never assumed, so a single instance works for any
-            `audio_length_in_s`.
+        latent_channels (`int`, *optional*, defaults to 8): Number of latent channels, i.e. `io_channels` of the
+            pipeline. The spatial size of the latents is never assumed, so a single instance works for any
+            `audio_length_in_s`. Stable Audio 3's latents are `(batch_size, channels, frames)`; the pipeline adds the
+            singleton height axis this encoder expects.
         target_embed_dim (`int`, *optional*, defaults to 512): Dimension of `target_embed`, i.e. the CLAP
-            `projection_dim` of the pipeline's `text_encoder`.
+            `projection_dim` of `losses.ClapLoss`.
         block_out_channels (`tuple[int, ...]`, *optional*, defaults to `(64, 128, 256)`): Output channels of each
             encoder level. Every level but the last is followed by a stride-2 downsample.
         layers_per_block (`int`, *optional*, defaults to 2): Number of `FiLMResnetBlock2D`s per encoder level.

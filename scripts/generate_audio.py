@@ -1,9 +1,10 @@
 r"""
 Generates audio with the stock `MusicLDMPipeline` for a list of prompts.
 
-Unlike `scripts/train.py` and `scripts/evaluate.py`, this script never touches
-`SteeringMusicLDMPipeline`: there is no steering target, predictor or steering window, just plain
-text-to-audio generation.
+MusicLDM is no longer the backbone of this project, which has moved to Stable Audio 3; this script is
+kept as the historical baseline the earlier results were produced with. It never touches any steering
+component: there is no steering target, predictor or steering window, just plain text-to-audio
+generation.
 
 Example, prompts given directly on the command line:
     uv run python scripts/generate_audio.py --prompt "A laid-back jazz trumpet solo over walking bass" \
@@ -17,14 +18,12 @@ Example, prompts read from a CSV file with a `prompt` column:
 import argparse
 import csv
 import json
-import wave
 from pathlib import Path
 
-import numpy as np
 import torch
 from diffusers import MusicLDMPipeline
 
-from utils import tensor_text_features
+from utils import save_waveform, tensor_text_features
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,18 +86,6 @@ def resolve_device_and_dtype() -> tuple[torch.device, torch.dtype]:
     dtype = torch.float32
 
     return device, dtype
-
-
-def save_waveform(path: Path, waveform: np.ndarray, sampling_rate: int) -> None:
-    """Writes mono float audio as clipped signed 16-bit PCM using only the standard library."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pcm = np.round(np.clip(np.asarray(waveform), -1.0, 1.0) * 32767.0).astype("<i2")
-    with wave.open(str(path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sampling_rate)
-        wav_file.writeframes(pcm.tobytes())
 
 
 def main() -> None:
