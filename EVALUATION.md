@@ -15,13 +15,50 @@ Evaluation runs with batch size one because the current pipeline records alpha a
 
 ## Before running
 
-First produce a checkpoint with the existing training entry point, for example:
+For a reportable suppression experiment, first use
+[`scripts/prepare_baselines_stable_audio_3.py`](BASELINE_SELECTION.md) to verify that each preassigned
+target is present in its paired `alpha=0` prompt/seed baseline. This prevents an absent baseline
+target from being counted as successful suppression. The selector also records which retain
+instruments were present.
+
+The preferred evaluator input is now the selector output directory:
 
 ```powershell
-uv run python scripts/train.py `
+uv run python scripts/evaluate.py `
+  --baseline-selection outputs/trumpet-baseline-selection `
+  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --output outputs/eval-selected
+```
+
+This mode evaluates only target-valid records, uses their explicit seeds, takes paired generation
+settings from the selector config, and scores the exact saved WAV as `base`. Conflicting settings are
+rejected rather than silently creating an unpaired comparison. The legacy `--dataset`, `--num-seeds`
+and `--seed` mode remains supported for diagnostics.
+
+First produce target-valid paired-alpha0 selections for the training and validation splits, using
+different numeric seed ranges, then train from those manifests:
+
+```powershell
+uv run python scripts/prepare_baselines_stable_audio_3.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
+  --output outputs/trumpet-train-baselines `
+  --baseline-mode paired-alpha0 --num-seeds 3 --seed 1000
+
+uv run python scripts/prepare_baselines_stable_audio_3.py `
+  --dataset datasets/trumpet_simple_splits/validation.csv `
+  --output outputs/trumpet-validation-baselines `
+  --baseline-mode paired-alpha0 --num-seeds 3 --seed 100000
+
+uv run python scripts/train.py `
+  --train-selection outputs/trumpet-train-baselines `
+  --validation-selection outputs/trumpet-validation-baselines `
   --output outputs/trumpet-target-specific
 ```
+
+The best checkpoint is selected by validation loss. It records hashes and metadata for both
+selection manifests and datasets, their target/seed counts, the complete generation configuration,
+optimizer settings, target vocabulary, training metrics and validation metrics. Legacy `--dataset`
+training remains supported, but selects by training loss because it has no held-out selection.
 
 Create the group-aware splits first with:
 
@@ -35,10 +72,10 @@ uv run python scripts/create_simple_splits.py `
 The split contains 132/44/44 train/validation/test rows. The two templates that share a genre and
 accompaniment are assigned together, preventing their near-duplicate pair from leaking across splits.
 
-For reportable results, evaluate a held-out CSV that was not passed to `train.py`. The evaluator
-checks the evaluation path against the dataset path stored in the checkpoint and writes a leakage
-warning when they match. Evaluating the training CSV remains useful as a diagnostic or smoke test,
-but does not measure generalization.
+For reportable results, evaluate a held-out CSV that was not used for either training or checkpoint
+selection. The evaluator checks the evaluation path against both dataset paths stored in new
+checkpoints and writes a leakage warning when it matches the training or validation split. Reusing
+either remains useful as a diagnostic, but does not measure held-out test generalization.
 
 The preferred CSV contract contains an explicit retain prompt:
 
@@ -79,6 +116,16 @@ uv run python scripts/evaluate.py `
   --fixed-alphas 0.25 0.5 0.75 1.0
 ```
 
+For a target-valid final evaluation, prefer the selection-driven equivalent:
+
+```powershell
+uv run python scripts/evaluate.py `
+  --baseline-selection outputs/trumpet-baseline-selection `
+  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --output outputs/eval-final-selected `
+  --fixed-alphas 0.25 0.5 0.75 1.0
+```
+
 Checkpoints whose `steering_mode` does not match the evaluator's are intentionally rejected. That
 covers the previous global-CFG formula, whose `alpha` values have a different meaning, and every
 checkpoint trained against MusicLDM, which does not share a latent space with Stable Audio 3.
@@ -90,6 +137,11 @@ Generation settings default to those stored in the checkpoint and can be overrid
 - `--audio-length-in-s`;
 - `--cfg-scale` and `--apg-scale`;
 - `--steering-frac-start` and `--steering-frac-end`.
+
+That override rule applies to legacy `--dataset` mode. With `--baseline-selection`, model, step count,
+duration, CFG/APG, negative prompt, precision and decode mode are inherited from the saved baselines;
+the steering window must also match both the selection and the checkpoint that was trained from it.
+A conflicting paired-setting override is rejected.
 
 The diffusion transformer is loaded in half precision unless `--no-half` is passed; the latent
 trajectory, the guidance algebra and the autoencoder are always float32. Audio saving can be disabled
@@ -112,6 +164,14 @@ For each generated waveform the evaluator records:
 - alpha mean, standard deviation, minimum and maximum;
 - fraction of steered steps with `alpha > 0.5`, where the interpolation weight assigned to
   retain-prompt guidance is larger than the weight assigned to full-prompt guidance.
+
+With `--baseline-selection`, every method row additionally records the baseline classifier's target
+score, requested and retain instruments, per-retain score/validity, and the lists
+`baseline_valid_retain_instruments` / `baseline_invalid_retain_instruments`. A retain instrument that
+was absent before steering is not evidence of collateral damage; the global CLAP retain score remains
+available as a prompt-level diagnostic. `summary.json` additionally reports
+`retain_similarity_change_all_retain_baseline_valid` for the clean subset where every requested retain
+instrument was detected in the baseline.
 
 Paired metrics compare a method with `base` for the same prompt and seed:
 
@@ -160,4 +220,5 @@ audio/
 
 `sample_metrics.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
 contains prompt-clustered bootstrap confidence intervals, while `report.md` provides the compact
-human-readable summary.
+human-readable summary. In selection mode `audio/base/` contains exact copies of the saved selector
+baselines rather than regenerated clips.

@@ -1,7 +1,6 @@
-import math
-
 import torch
 import torch.nn.functional as F
+import torchaudio.functional as AF
 from torch import nn
 from transformers import ClapFeatureExtractor, ClapModel, RobertaTokenizer
 
@@ -70,10 +69,6 @@ class ClapLoss(nn.Module):
             persistent=False,
         )
 
-        # built on first use, since the rate to resample *from* is only known per call. kept on the
-        # CPU in double precision and cast at the call site; a few hundred taps make that free
-        self._resample_kernels: dict[tuple[int, int], torch.Tensor] = {}
-
     @classmethod
     def from_pretrained(cls, model_id: str = DEFAULT_CLAP_MODEL_ID, reduction: str = "mean") -> "ClapLoss":
         r"""Loads the CLAP model, tokenizer and feature extractor of `model_id` and wraps them."""
@@ -90,36 +85,7 @@ class ClapLoss(nn.Module):
         return int(self.text_encoder.config.projection_dim)
 
     @staticmethod
-    def _build_resample_kernel(up: int, down: int, half_width: int = 32) -> torch.Tensor:
-        r"""
-        Builds the windowed-sinc lowpass of a rational `up / down` resampler.
-
-        The filter runs at the zero-stuffed rate and has to suppress everything above the lower of
-        the two Nyquist frequencies: the images that zero-stuffing creates when upsampling, and the
-        content that would alias when decimating.
-
-        Args:
-            up (`int`): Zero-stuffing factor, i.e. the numerator of the rate ratio.
-            down (`int`): Decimation factor, i.e. the denominator of the rate ratio.
-            half_width (`int`, *optional*, defaults to 32): Number of periods of the sinc kept on
-                each side of its centre. Wider is sharper; 32 puts the transition band well inside
-                the gap between the two rates for the 160/147 ratio that 44.1 kHz to 48 kHz needs.
-
-        Returns:
-            `torch.Tensor`: Kernel of shape `(2 * half_width * max(up, down) + 1,)`, odd-length so
-            the group delay is an integer number of samples.
-        """
-        stride = max(up, down)
-        num_taps = 2 * half_width * stride + 1
-
-        positions = torch.arange(num_taps, dtype=torch.float64) - (num_taps - 1) / 2
-        kernel = torch.sinc(positions / stride)
-        kernel = kernel * torch.hamming_window(num_taps, periodic=False, dtype=torch.float64)
-
-        # the `up - 1` inserted zeros divide the passband gain by `up`, so normalize it back
-        return kernel / kernel.sum() * up
-
-    def _resample(self, waveform: torch.Tensor, orig_rate: int, target_rate: int) -> torch.Tensor:
+    def _resample(waveform: torch.Tensor, orig_rate: int, target_rate: int) -> torch.Tensor:
         r"""
         Band-limited rational resampling, differentiably with respect to `waveform`.
 
@@ -131,27 +97,15 @@ class ClapLoss(nn.Module):
         Returns:
             `torch.Tensor`: Waveform of shape `(batch_size, num_samples * up // down)`.
         """
-        divisor = math.gcd(orig_rate, target_rate)
-        up, down = target_rate // divisor, orig_rate // divisor
-
-        if up == 1 and down == 1:
+        if orig_rate < 1 or target_rate < 1:
+            raise ValueError(f"sampling rates must be positive but are {orig_rate} and {target_rate}")
+        if orig_rate == target_rate:
             return waveform
 
-        if (up, down) not in self._resample_kernels:
-            self._resample_kernels[(up, down)] = self._build_resample_kernel(up, down)
-        kernel = self._resample_kernels[(up, down)].to(device=waveform.device, dtype=waveform.dtype)
-
-        batch_size, num_samples = waveform.shape
-        upsampled = waveform.new_zeros(batch_size, num_samples * up)
-        upsampled[:, ::up] = waveform
-
-        # a linear-phase kernel of odd length is symmetric, so padding by half its width and
-        # convolving without further padding lands the output back on the input grid
-        padding = kernel.shape[-1] // 2
-        upsampled = F.pad(upsampled.unsqueeze(1), (padding, padding), mode="reflect")
-        filtered = F.conv1d(upsampled, kernel.view(1, 1, -1)).squeeze(1)
-
-        return filtered[:, ::down]
+        # torchaudio implements the same band-limited sinc operation without explicitly allocating
+        # the 160x zero-stuffed intermediate required by a naive 44.1 -> 48 kHz rational resampler.
+        # It remains differentiable with respect to waveform, which is required by training.
+        return AF.resample(waveform, orig_rate, target_rate)
 
     def encode_audio(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
         r"""
@@ -161,15 +115,9 @@ class ClapLoss(nn.Module):
         using `torch` ops, since the reference implementation runs in numpy and would detach the
         waveform from the graph.
 
-        Resampling is band-limited (`_resample`). A cheaper interpolation would leave spectral
-        images of the whole signal above `sampling_rate / 2`, and because those images are
-        reflections of the content itself they corrupt every clip differently rather than adding a
-        harmless constant offset. Stable Audio 3's 44.1 kHz and CLAP's 48 kHz are close enough that
-        the images would land right inside the mel bank, which spans to 24 kHz.
-
-        Note that 44.1 kHz to 48 kHz is the rational ratio 160/147, so the kernel is far longer than
-        the 3x one a 16 kHz source needs. If this becomes the bottleneck of a training run,
-        `torchaudio.functional.resample` is a differentiable drop-in.
+        Resampling is the differentiable, band-limited implementation from
+        `torchaudio.functional.resample`. In particular it avoids materializing the 160x
+        zero-stuffed intermediate of a naive 44.1 kHz to 48 kHz rational resampler.
 
         Args:
             waveform (`torch.Tensor`): Waveform of shape `(batch_size, num_samples)`. Stereo audio

@@ -1,6 +1,7 @@
 import importlib.util
 import math
 import unittest
+from types import SimpleNamespace
 
 
 if importlib.util.find_spec("torch") is None or importlib.util.find_spec("stable_audio_3") is None:
@@ -8,7 +9,9 @@ if importlib.util.find_spec("torch") is None or importlib.util.find_spec("stable
 
 import torch
 
-from pipelines import SteeringDiffusionTransformer, SteeringPredictor, SteeringStableAudioPipeline
+from pipelines import FixedAlphaSteering, SteeringDiffusionTransformer, SteeringPredictor, SteeringStableAudioPipeline
+from scripts.evaluate import resolve_generation_config
+from scripts.train import normalize_accumulated_gradients
 
 
 class TargetSpecificSteeringTests(unittest.TestCase):
@@ -89,6 +92,52 @@ class TargetSpecificSteeringTests(unittest.TestCase):
 
         self.assertEqual(alpha.shape, (2, 1, 1, 1))
         self.assertTrue(torch.all((alpha >= 0.0) & (alpha <= 1.0)))
+
+    def test_selection_generation_settings_are_inherited_and_conflicts_rejected(self) -> None:
+        args = SimpleNamespace(
+            num_inference_steps=None,
+            audio_length_in_s=None,
+            cfg_scale=None,
+            apg_scale=None,
+            steering_frac_start=None,
+            steering_frac_end=None,
+            negative_prompt=None,
+            chunked_decode=None,
+        )
+        checkpoint_args = {"steering_frac_start": 0.2, "steering_frac_end": 0.7}
+        baseline = {
+            "num_inference_steps": 50,
+            "audio_length_in_s": 10.0,
+            "cfg_scale": 7.0,
+            "apg_scale": 0.0,
+            "negative_prompt": None,
+            "chunked_decode": False,
+        }
+
+        resolved = resolve_generation_config(args, checkpoint_args, baseline)
+
+        self.assertEqual(resolved["num_inference_steps"], 50)
+        self.assertEqual(resolved["steering_frac_start"], 0.2)
+        self.assertFalse(resolved["chunked_decode"])
+
+        args.cfg_scale = 5.0
+        with self.assertRaisesRegex(ValueError, "does not match saved baseline"):
+            resolve_generation_config(args, checkpoint_args, baseline)
+
+    def test_fixed_alpha_controller_returns_one_value_per_sample(self) -> None:
+        controller = FixedAlphaSteering(0.0)
+        alpha = controller(torch.randn(3, 4, 1, 8), torch.tensor([1.0]), torch.randn(3, 2))
+        self.assertEqual(alpha.shape, (3, 1, 1, 1))
+        self.assertTrue(torch.equal(alpha, torch.zeros_like(alpha)))
+
+    def test_accumulated_gradients_are_normalized_by_exact_sample_count(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        # Two batch means with sizes 2 and 1. Accumulating their sample sums should produce
+        # (2 * 2 + 1 * 8) / 3 = 4 after exact sample normalization.
+        (parameter * 2.0 * 2).backward()
+        (parameter * 8.0 * 1).backward()
+        normalize_accumulated_gradients([parameter], sample_count=3)
+        self.assertTrue(torch.isclose(parameter.grad, torch.tensor(4.0)))
 
 
 if __name__ == "__main__":

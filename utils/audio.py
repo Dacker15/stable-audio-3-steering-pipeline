@@ -27,3 +27,25 @@ def save_waveform(path: Path, waveform: np.ndarray, sampling_rate: int) -> None:
         wav_file.setsampwidth(2)
         wav_file.setframerate(sampling_rate)
         wav_file.writeframes(frames.tobytes())
+
+
+def load_waveform(path: Path) -> tuple[np.ndarray, int]:
+    r"""Reads the 16-bit PCM WAV format written by :func:`save_waveform`.
+
+    Returns audio as float32 with shape ``(channels, samples)`` and its sampling rate.
+    """
+    path = Path(path)
+    with wave.open(str(path), "rb") as wav_file:
+        if wav_file.getsampwidth() != 2:
+            raise ValueError(f"{path} must be 16-bit PCM but has sample width {wav_file.getsampwidth()} bytes")
+        if wav_file.getcomptype() != "NONE":
+            raise ValueError(f"{path} must be uncompressed PCM but uses {wav_file.getcomptype()!r}")
+        channels = wav_file.getnchannels()
+        sampling_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    pcm = np.frombuffer(frames, dtype="<i2")
+    if channels < 1 or pcm.size % channels != 0:
+        raise ValueError(f"{path} has an invalid interleaved channel layout")
+    waveform = pcm.reshape(-1, channels).T.astype(np.float32) / 32767.0
+    return waveform, int(sampling_rate)

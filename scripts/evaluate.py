@@ -1,5 +1,5 @@
 r"""
-Evaluates a trained ``SteeringPredictor`` against the unsteered Stable Audio 3 baseline.
+Evaluates a trained ``SteeringPredictor`` against its paired ``alpha=0`` Stable Audio 3 baseline.
 
 Example smoke test (using a checkpoint produced by ``scripts/train.py``):
 
@@ -15,6 +15,14 @@ Example final run with fixed-alpha controls:
         --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
         --output outputs/eval-final --num-seeds 5 \
         --fixed-alphas 0.25 0.5 0.75 1.0
+
+Preferred paired run from the baseline selector (uses its target-valid pairs, saved baseline audio,
+explicit seeds and generation settings):
+
+    uv run python scripts/evaluate.py \
+        --baseline-selection outputs/trumpet-baseline-selection \
+        --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
+        --output outputs/eval-selected
 """
 
 import argparse
@@ -31,8 +39,9 @@ import torch
 from torch import nn
 
 from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
-from utils import PromptTargetDataset, save_waveform
+from pipelines import FixedAlphaSteering, STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
+from utils import PromptTargetDataset, load_waveform, save_waveform
+from utils.instrument_classification import BaselineSelection, load_baseline_selection
 
 
 MODEL = "medium-base"
@@ -45,6 +54,7 @@ FALLBACK_GENERATION_CONFIG = {
     "steering_frac_end": 0.8,
 }
 SAMPLE_FIELDS = [
+    "pair_id",
     "sample_id",
     "seed_index",
     "seed",
@@ -53,6 +63,16 @@ SAMPLE_FIELDS = [
     "target",
     "retain_prompt",
     "audio_path",
+    "baseline_source_audio_path",
+    "requested_instruments",
+    "retain_instruments",
+    "baseline_target_instrument_score",
+    "baseline_target_valid",
+    "baseline_retain_instrument_scores",
+    "baseline_retain_instrument_validity",
+    "baseline_valid_retain_instruments",
+    "baseline_invalid_retain_instruments",
+    "all_retain_baseline_valid",
     "target_similarity",
     "prompt_similarity",
     "retain_similarity",
@@ -66,24 +86,15 @@ SAMPLE_FIELDS = [
     "alpha_max",
     "retain_dominant_ratio",
 ]
+SAMPLE_JSON_FIELDS = {
+    "requested_instruments",
+    "retain_instruments",
+    "baseline_retain_instrument_scores",
+    "baseline_retain_instrument_validity",
+    "baseline_valid_retain_instruments",
+    "baseline_invalid_retain_instruments",
+}
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
-
-
-class FixedAlphaSteering(nn.Module):
-    """Pipeline-compatible controller returning one constant alpha per sample."""
-
-    def __init__(self, alpha: float):
-        super().__init__()
-        self.alpha = float(alpha)
-
-    def forward(self, latents: torch.Tensor, t: torch.Tensor, target_embed: torch.Tensor) -> torch.Tensor:
-        del t, target_embed
-        return torch.full(
-            (latents.shape[0], 1, 1, 1),
-            self.alpha,
-            device=latents.device,
-            dtype=latents.dtype,
-        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,12 +107,26 @@ def parse_args() -> argparse.Namespace:
     data.add_argument(
         "--dataset",
         type=Path,
-        required=True,
-        help="evaluation CSV with prompt,target and preferably an explicit retain_prompt column",
+        default=None,
+        help="legacy evaluation CSV; mutually exclusive with --baseline-selection",
+    )
+    data.add_argument(
+        "--baseline-selection",
+        type=Path,
+        default=None,
+        help=(
+            "output directory (or baseline_records.jsonl) from prepare_baselines_stable_audio_3.py; "
+            "evaluates only target-valid pairs with their explicit seeds and saved baselines"
+        ),
     )
     data.add_argument("--checkpoint", type=Path, required=True, help="checkpoint produced by scripts/train.py")
     data.add_argument("--output", type=Path, default=Path("outputs/evaluation"))
-    data.add_argument("--max-samples", type=int, default=None, help="evaluate only the first N prompts")
+    data.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="evaluate the first N prompts in dataset mode or the first N eligible pairs in selection mode",
+    )
     data.add_argument(
         "--replace-output",
         action="store_true",
@@ -120,12 +145,34 @@ def parse_args() -> argparse.Namespace:
 
     generation = parser.add_argument_group("generation")
     generation.add_argument("--model", default=None, help="Stable Audio 3 `-base` checkpoint, defaults to the one trained against")
-    generation.add_argument("--num-seeds", type=int, default=1, help="independent noises generated per prompt")
-    generation.add_argument("--seed", type=int, default=1000, help="first evaluation seed")
+    generation.add_argument(
+        "--num-seeds",
+        type=int,
+        default=None,
+        help="independent noises per prompt in dataset mode; seeds come from --baseline-selection otherwise",
+    )
+    generation.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="first seed in dataset mode; explicit record seeds are used with --baseline-selection",
+    )
     generation.add_argument("--num-inference-steps", type=int, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--audio-length-in-s", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--cfg-scale", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--apg-scale", type=float, default=None, help="defaults to checkpoint setting")
+    generation.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=None,
+        help="must match the baseline-selection setting in selection mode",
+    )
+    generation.add_argument(
+        "--chunked-decode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="must match the baseline-selection setting; defaults to disabled in legacy dataset mode",
+    )
     generation.add_argument("--steering-frac-start", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--steering-frac-end", type=float, default=None, help="defaults to checkpoint setting")
 
@@ -142,9 +189,16 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--clipping-threshold", type=float, default=0.999)
 
     args = parser.parse_args()
+    if (args.dataset is None) == (args.baseline_selection is None):
+        parser.error("exactly one of --dataset or --baseline-selection must be provided")
     if args.max_samples is not None and args.max_samples < 1:
         parser.error("--max-samples must be at least 1")
-    if args.num_seeds < 1:
+    if args.baseline_selection is not None and (args.num_seeds is not None or args.seed is not None):
+        parser.error("--num-seeds and --seed cannot be used with --baseline-selection; its explicit seeds are used")
+    if args.dataset is not None:
+        args.num_seeds = 1 if args.num_seeds is None else args.num_seeds
+        args.seed = 1000 if args.seed is None else args.seed
+    if args.num_seeds is not None and args.num_seeds < 1:
         parser.error("--num-seeds must be at least 1")
     if args.bootstrap_samples < 1:
         parser.error("--bootstrap-samples must be at least 1")
@@ -155,13 +209,50 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -> dict[str, float | int]:
-    """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
+def _same_setting(left, right) -> bool:
+    if isinstance(left, (float, int)) and isinstance(right, (float, int)):
+        return bool(np.isclose(float(left), float(right), rtol=0.0, atol=1e-9))
+    return left == right
+
+
+def resolve_generation_config(
+    args: argparse.Namespace,
+    checkpoint_args: dict,
+    baseline_generation: dict | None = None,
+) -> dict[str, float | int | str | bool | None]:
+    """Keeps saved-baseline settings fixed; legacy mode retains CLI/checkpoint fallback behaviour."""
 
     resolved = {}
+    paired_names = {"num_inference_steps", "audio_length_in_s", "cfg_scale", "apg_scale"}
     for name, fallback in FALLBACK_GENERATION_CONFIG.items():
         cli_value = getattr(args, name)
-        resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
+        if baseline_generation is not None and name in paired_names:
+            if name not in baseline_generation:
+                raise ValueError(f"baseline-selection config is missing generation setting {name!r}")
+            baseline_value = baseline_generation[name]
+            if cli_value is not None and not _same_setting(cli_value, baseline_value):
+                raise ValueError(
+                    f"--{name.replace('_', '-')}={cli_value} does not match saved baseline value {baseline_value}"
+                )
+            resolved[name] = baseline_value
+        else:
+            resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
+
+    if baseline_generation is not None:
+        for name, cli_value, fallback in (
+            ("negative_prompt", args.negative_prompt, None),
+            ("chunked_decode", args.chunked_decode, False),
+        ):
+            baseline_value = baseline_generation.get(name, fallback)
+            if cli_value is not None and not _same_setting(cli_value, baseline_value):
+                raise ValueError(
+                    f"--{name.replace('_', '-')}={cli_value!r} does not match saved baseline value"
+                    f" {baseline_value!r}"
+                )
+            resolved[name] = baseline_value
+    else:
+        resolved["negative_prompt"] = args.negative_prompt
+        resolved["chunked_decode"] = False if args.chunked_decode is None else args.chunked_decode
 
     resolved["num_inference_steps"] = int(resolved["num_inference_steps"])
     for name in ("audio_length_in_s", "cfg_scale", "apg_scale", "steering_frac_start", "steering_frac_end"):
@@ -188,6 +279,50 @@ def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -
         raise ValueError("the selected steering window contains no denoising step")
     resolved["num_steered_steps"] = active_steps
     return resolved
+
+
+def validate_checkpoint_selection_compatibility(checkpoint: dict, selection: BaselineSelection | None) -> None:
+    r"""Rejects paired runs outside the generation/target domain recorded by new checkpoints."""
+    if selection is None:
+        return
+
+    baseline_mode = selection.config.get("baseline_mode")
+    if baseline_mode != "paired_alpha0":
+        warnings.warn(
+            "This selection was not generated with paired-alpha0 baselines. Its saved base uses a different "
+            "transformer branch from steered methods, so paired deltas may include a computation-path effect.",
+            stacklevel=2,
+        )
+
+    checkpoint_generation = checkpoint.get("generation")
+    if checkpoint_generation is None:
+        return
+    baseline_generation = selection.config["generation"]
+    for name in (
+        "model",
+        "model_half",
+        "num_inference_steps",
+        "audio_length_in_s",
+        "cfg_scale",
+        "apg_scale",
+        "negative_prompt",
+        "chunked_decode",
+        "steering_frac_start",
+        "steering_frac_end",
+    ):
+        if name not in checkpoint_generation or name not in baseline_generation:
+            raise ValueError(f"checkpoint or baseline selection is missing compatibility setting {name!r}")
+        if not _same_setting(checkpoint_generation[name], baseline_generation[name]):
+            raise ValueError(
+                f"baseline selection {name}={baseline_generation[name]!r} does not match checkpoint training "
+                f"value {checkpoint_generation[name]!r}"
+            )
+
+    trained_targets = set(checkpoint.get("training_targets", checkpoint.get("targets", [])))
+    evaluation_targets = {str(pair.record["target"]) for pair in selection.pairs}
+    unseen_targets = sorted(evaluation_targets - trained_targets)
+    if trained_targets and unseen_targets:
+        raise ValueError(f"baseline selection contains targets unseen by the checkpoint: {unseen_targets}")
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -256,6 +391,107 @@ def alpha_metrics(records: list[tuple[float, float]]) -> dict[str, float | None]
         "alpha_max": float(values.max()),
         "retain_dominant_ratio": float(np.mean(values > 0.5)),
     }
+
+
+def sample_row_to_csv(row: dict) -> dict:
+    return {
+        field: json.dumps(row[field], sort_keys=True) if field in SAMPLE_JSON_FIELDS else row[field]
+        for field in SAMPLE_FIELDS
+    }
+
+
+def baseline_metadata(record: dict | None, source_audio_path: Path | None = None) -> dict:
+    if record is None:
+        return {
+            "baseline_source_audio_path": "",
+            "requested_instruments": [],
+            "retain_instruments": [],
+            "baseline_target_instrument_score": None,
+            "baseline_target_valid": None,
+            "baseline_retain_instrument_scores": {},
+            "baseline_retain_instrument_validity": {},
+            "baseline_valid_retain_instruments": [],
+            "baseline_invalid_retain_instruments": [],
+            "all_retain_baseline_valid": None,
+        }
+
+    validity = {name: bool(value) for name, value in record["retain_instrument_validity"].items()}
+    return {
+        "baseline_source_audio_path": "" if source_audio_path is None else str(source_audio_path),
+        "requested_instruments": list(record["requested_instruments"]),
+        "retain_instruments": list(record["retain_instruments"]),
+        "baseline_target_instrument_score": float(record["target_score"]),
+        "baseline_target_valid": bool(record["target_valid"]),
+        "baseline_retain_instrument_scores": {
+            name: float(value) for name, value in record["retain_instrument_scores"].items()
+        },
+        "baseline_retain_instrument_validity": validity,
+        "baseline_valid_retain_instruments": [name for name, valid in validity.items() if valid],
+        "baseline_invalid_retain_instruments": [name for name, valid in validity.items() if not valid],
+        "all_retain_baseline_valid": record["all_retain_valid"],
+    }
+
+
+def build_evaluation_pairs(
+    dataset: PromptTargetDataset | None,
+    selection: BaselineSelection | None,
+    first_seed: int | None,
+    num_seeds: int | None,
+) -> list[dict]:
+    if selection is not None:
+        return [
+            {
+                "pair_id": pair.pair_id,
+                "sample_id": int(pair.record["sample_id"]),
+                "seed_index": int(pair.record["seed_index"]),
+                "seed": int(pair.record["seed"]),
+                "prompt": str(pair.record["prompt"]),
+                "target": str(pair.record["target"]),
+                "retain_prompt": str(pair.record["retain_prompt"]),
+                "baseline_record": pair.record,
+                "baseline_audio_path": pair.audio_path,
+            }
+            for pair in selection.pairs
+        ]
+
+    if dataset is None or first_seed is None or num_seeds is None:
+        raise ValueError("dataset mode requires a dataset, first_seed and num_seeds")
+    pairs = []
+    for sample_id, (prompt, target, retain_prompt) in enumerate(dataset.rows):
+        for seed_index in range(num_seeds):
+            seed = first_seed + seed_index * len(dataset) + sample_id
+            pairs.append(
+                {
+                    "pair_id": f"sample_{sample_id:04d}_seed_{seed}",
+                    "sample_id": sample_id,
+                    "seed_index": seed_index,
+                    "seed": seed,
+                    "prompt": prompt,
+                    "target": target,
+                    "retain_prompt": retain_prompt,
+                    "baseline_record": None,
+                    "baseline_audio_path": None,
+                }
+            )
+    return pairs
+
+
+def score_waveform_with_clap(
+    waveform: np.ndarray,
+    sampling_rate: int,
+    clap: ClapLoss,
+    device: torch.device,
+    prompt: str,
+    target: str,
+    retain_prompt: str,
+) -> tuple[float, float, float]:
+    waveform_tensor = torch.from_numpy(np.asarray(waveform)).unsqueeze(0).to(device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        audio_embeds = clap.encode_audio(waveform_tensor.mean(dim=1), sampling_rate)
+        target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
+        prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
+        retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
+    return target_similarity, prompt_similarity, retain_similarity
 
 
 def _mean_ci_by_prompt(
@@ -327,6 +563,12 @@ def summarize(
             method_summary["retain_similarity_change"] = _mean_ci_by_prompt(
                 paired, lambda row: row["retain_change"], bootstrap_samples, rng
             )
+            all_retain_valid = [row for row in paired if row.get("all_retain_baseline_valid") is True]
+            if all_retain_valid:
+                method_summary["retain_similarity_change_all_retain_baseline_valid"] = _mean_ci_by_prompt(
+                    all_retain_valid, lambda row: row["retain_change"], bootstrap_samples, rng
+                )
+                method_summary["num_pairs_all_retain_baseline_valid"] = len(all_retain_valid)
 
             prompt_gains: dict[int, list[float]] = defaultdict(list)
             for row in paired:
@@ -421,22 +663,43 @@ def plot_alpha_schedules(alpha_runs: list[dict], path: Path) -> None:
 
 
 def write_report(path: Path, config: dict, summary: dict) -> None:
+    seeds_text = "record-specific" if config["num_seeds"] is None else str(config["num_seeds"])
     lines = [
         "# Steering evaluation report",
         "",
         f"- Evaluation prompts: {config['num_prompts']}",
-        f"- Seeds per prompt: {config['num_seeds']}",
+        f"- Prompt/seed pairs: {config['num_pairs']}",
+        f"- Seeds per prompt: {seeds_text}",
+        f"- Seed source: `{config['seed_source']}`",
         f"- Target counts: `{json.dumps(config['target_counts'], sort_keys=True)}`",
         f"- Denoising steps: {config['generation']['num_inference_steps']}",
         f"- Steering window: [{config['generation']['steering_frac_start']}, "
         f"{config['generation']['steering_frac_end']})",
+        f"- Checkpoint selection metric: `{config['checkpoint_selection_metric'] or 'legacy/unknown'}`",
+        f"- Checkpoint selection value: `{config['checkpoint_selection_value']}`",
         "",
     ]
-    if config["same_dataset_as_training"]:
+    if config["input_mode"] == "baseline_selection":
         lines.extend(
             [
-                "> **Data leakage warning:** the evaluation dataset path is the same path stored in the training "
-                "checkpoint. These results are diagnostic and must not be reported as held-out performance.",
+                f"> Loaded only target-valid pairs from `{config['baseline_records']}`. The `base` rows reuse the"
+                " exact saved WAV files; steered methods recreate each record's explicit seed and generation"
+                " settings.",
+                "",
+                f"- Baseline computation mode: `{config['baseline_mode']}`",
+                f"- Pairs whose complete retain set was present in the baseline: "
+                f"{config['num_pairs_all_retain_baseline_valid']}/{config['num_pairs']}",
+                f"- Pairs with at least one absent retain instrument: "
+                f"{config['num_pairs_with_invalid_retain_baseline']}",
+                "",
+            ]
+        )
+    if config["dataset_overlap_role"] is not None:
+        lines.extend(
+            [
+                f"> **Data leakage warning:** the evaluation dataset is the checkpoint's "
+                f"`{config['dataset_overlap_role']}` split. These results are diagnostic and must not be "
+                "reported as held-out test performance.",
                 "",
             ]
         )
@@ -476,6 +739,11 @@ def write_report(path: Path, config: dict, summary: dict) -> None:
             "- Positive retain-similarity change means the method kept more of the rest of the prompt than the paired "
             "base audio; a large suppression gain paired with a negative retain change usually means degraded audio "
             "rather than a removed concept.",
+            "- In baseline-selection mode, `baseline_retain_instrument_validity` in `sample_metrics.csv` says which "
+            "retain instruments were actually detected before steering. An absent retain instrument must not be "
+            "used to claim collateral preservation or damage; the global CLAP retain score remains a prompt-level "
+            "diagnostic. `summary.json` also reports `retain_similarity_change_all_retain_baseline_valid`, restricted "
+            "to pairs whose complete retain set was detected in the baseline.",
             "- Only the legacy fallback removal is lexical: modifiers of the target can survive it "
             "(\"muted trumpet with a plunger mute\" becomes \"muted with a plunger mute\"). Explicit retain "
             "prompts avoid this wording artifact.",
@@ -491,19 +759,34 @@ def write_report(path: Path, config: dict, summary: dict) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _same_dataset_as_training(eval_path: Path, checkpoint_args: dict) -> bool:
-    training_path = checkpoint_args.get("dataset")
-    if training_path is None:
-        return False
+def _dataset_overlap_role(eval_path: Path, checkpoint_args: dict, checkpoint_data: dict | None) -> str | None:
+    r"""Returns the checkpoint split whose source dataset is being reused, if any."""
+    candidates: list[tuple[str, str | None]] = [("training", checkpoint_args.get("dataset"))]
+    if checkpoint_data and checkpoint_data.get("mode") == "target_valid_baseline_selections":
+        candidates.extend(
+            (role, checkpoint_data.get(role, {}).get("dataset"))
+            for role in ("training", "validation")
+        )
+
     try:
-        return eval_path.resolve() == Path(training_path).resolve()
+        resolved_eval = eval_path.resolve()
+        for role, candidate in candidates:
+            if candidate is not None and resolved_eval == Path(candidate).resolve():
+                return role
     except OSError:
-        return False
+        return None
+    return None
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = prepare_output_directory(args.output, args.replace_output)
+
+    selection = (
+        None
+        if args.baseline_selection is None
+        else load_baseline_selection(args.baseline_selection, max_pairs=args.max_samples)
+    )
+    dataset = None if args.dataset is None else PromptTargetDataset(args.dataset, args.max_samples)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     required_keys = {"state_dict", "config"}
@@ -521,9 +804,35 @@ def main() -> None:
             f" requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be evaluated on Stable Audio 3:"
             " the two backbones do not share a latent space."
         )
+    validate_checkpoint_selection_compatibility(checkpoint, selection)
     checkpoint_args = checkpoint.get("args", {})
-    generation_config = resolve_generation_config(args, checkpoint_args)
+    baseline_generation = None if selection is None else selection.config["generation"]
+    generation_config = resolve_generation_config(args, checkpoint_args, baseline_generation)
+    if selection is not None and checkpoint.get("generation") is not None:
+        for name in ("steering_frac_start", "steering_frac_end"):
+            trained_value = checkpoint["generation"][name]
+            if not _same_setting(generation_config[name], trained_value):
+                raise ValueError(
+                    f"evaluation {name}={generation_config[name]!r} does not match checkpoint training value "
+                    f"{trained_value!r}"
+                )
     predictor_config = checkpoint["config"]
+
+    if selection is not None:
+        if "model" not in baseline_generation:
+            raise ValueError("baseline-selection config is missing its Stable Audio 3 model")
+        baseline_model = str(baseline_generation["model"])
+        if args.model is not None and args.model != baseline_model:
+            raise ValueError(
+                f"--model={args.model!r} does not match the saved baseline model {baseline_model!r}"
+            )
+        model_name = baseline_model
+        model_half = bool(baseline_generation.get("model_half", True))
+        if args.no_half and model_half:
+            raise ValueError("--no-half does not match the half-precision transformer used for the saved baselines")
+    else:
+        model_name = args.model or checkpoint.get("model") or MODEL
+        model_half = not args.no_half
 
     alpha_min = float(predictor_config.get("alpha_min", 0.0))
     alpha_max = float(predictor_config.get("alpha_max", 1.0))
@@ -533,29 +842,49 @@ def main() -> None:
                 f"fixed alpha {alpha} lies outside the predictor's configured range [{alpha_min}, {alpha_max}]"
             )
 
-    dataset = PromptTargetDataset(args.dataset, args.max_samples)
+    evaluation_pairs = build_evaluation_pairs(dataset, selection, args.seed, args.num_seeds)
     device = resolve_device(args.device)
-    model_name = args.model or checkpoint.get("model") or MODEL
-    same_dataset = _same_dataset_as_training(args.dataset, checkpoint_args)
-    if same_dataset:
+    dataset_path = Path(selection.config["dataset"]) if selection is not None else args.dataset
+    dataset_overlap_role = _dataset_overlap_role(dataset_path, checkpoint_args, checkpoint.get("data"))
+    if dataset_overlap_role is not None:
         warnings.warn(
-            "The evaluation CSV is the same dataset path stored in the checkpoint. Results measure training-set "
-            "behaviour, not held-out generalization.",
+            f"The evaluation CSV is the checkpoint's {dataset_overlap_role} split. Results are diagnostic, not "
+            "held-out test performance.",
             stacklevel=2,
         )
 
+    output_dir = prepare_output_directory(args.output, args.replace_output)
+    prompt_targets = {}
+    seed_counts: Counter[int] = Counter()
+    for pair in evaluation_pairs:
+        prompt_targets.setdefault((int(pair["sample_id"]), pair["prompt"]), pair["target"])
+        seed_counts[int(pair["sample_id"])] += 1
+    seed_count_values = set(seed_counts.values())
+    uniform_num_seeds = next(iter(seed_count_values)) if len(seed_count_values) == 1 else None
+    summary_seed = int(
+        args.seed if args.seed is not None else selection.config.get("first_seed", evaluation_pairs[0]["seed"])
+    )
+    selection_records = [pair["baseline_record"] for pair in evaluation_pairs if pair["baseline_record"] is not None]
+
     config = {
-        "dataset": str(args.dataset.resolve()),
+        "input_mode": "baseline_selection" if selection is not None else "dataset",
+        "dataset": str(dataset_path.resolve()),
+        "baseline_selection": None if selection is None else str(selection.root),
+        "baseline_records": None if selection is None else str(selection.records_path),
         "checkpoint": str(args.checkpoint.resolve()),
         "output": str(output_dir),
         "model": model_name,
-        "num_prompts": len(dataset),
-        "num_seeds": args.num_seeds,
-        "first_seed": args.seed,
-        "target_counts": dict(Counter(target for _, target, _ in dataset.rows)),
-        "same_dataset_as_training": same_dataset,
+        "num_prompts": len(prompt_targets),
+        "num_pairs": len(evaluation_pairs),
+        "num_seeds": uniform_num_seeds,
+        "first_seed": None if selection is not None else args.seed,
+        "seed_source": "baseline_selection_records" if selection is not None else "evaluator_formula",
+        "target_counts": dict(Counter(prompt_targets.values())),
+        "same_dataset_as_training": dataset_overlap_role == "training",
+        "same_dataset_as_validation": dataset_overlap_role == "validation",
+        "dataset_overlap_role": dataset_overlap_role,
         "device": str(device),
-        "model_half": not args.no_half,
+        "model_half": model_half,
         "fixed_alphas": args.fixed_alphas,
         "save_audio": args.save_audio,
         "silence_threshold": args.silence_threshold,
@@ -564,12 +893,30 @@ def main() -> None:
         "generation": generation_config,
         "checkpoint_epoch": checkpoint.get("epoch"),
         "checkpoint_training_loss": checkpoint.get("loss"),
+        "checkpoint_validation_loss": (
+            None if checkpoint.get("validation_metrics") is None else checkpoint["validation_metrics"].get("loss")
+        ),
+        "checkpoint_selection_metric": checkpoint.get("checkpoint_selection_metric"),
+        "checkpoint_selection_value": checkpoint.get("checkpoint_selection_value"),
+        "checkpoint_data": checkpoint.get("data"),
         "steering_mode": checkpoint["steering_mode"],
+        "baseline_mode": None if selection is None else selection.config.get("baseline_mode", "stock_legacy"),
+        "baseline_classifier": None if selection is None else selection.config["classifier"],
+        "num_pairs_all_retain_baseline_valid": sum(
+            record["all_retain_valid"] is True for record in selection_records
+        ),
+        "num_pairs_with_invalid_retain_baseline": sum(
+            any(not bool(value) for value in record["retain_instrument_validity"].values())
+            for record in selection_records
+        ),
+        "bootstrap_seed": summary_seed,
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    print(f"Loading {model_name} on {device} with {'float32' if args.no_half else 'half'} precision")
-    pipe = SteeringStableAudioPipeline.from_pretrained(model_name, device=device, model_half=not args.no_half)
+    if selection is not None:
+        print(f"Loaded {len(evaluation_pairs)} target-valid prompt/seed pairs from {selection.records_path}")
+    print(f"Loading {model_name} on {device} with {'half' if model_half else 'float32'} precision")
+    pipe = SteeringStableAudioPipeline.from_pretrained(model_name, device=device, model_half=model_half)
     pipe.diffusion.requires_grad_(False)
     pipe.diffusion.eval()
 
@@ -578,10 +925,9 @@ def main() -> None:
     predictor.requires_grad_(False)
     predictor.eval()
 
-    methods: dict[str, nn.Module] = {
-        "base": FixedAlphaSteering(0.0).to(device),
-        "learned": predictor,
-    }
+    methods: dict[str, nn.Module] = {"learned": predictor}
+    if selection is None:
+        methods = {"base": FixedAlphaSteering(0.0).to(device), **methods}
     for alpha in args.fixed_alphas:
         name = fixed_alpha_name(alpha)
         if name in methods:
@@ -593,13 +939,13 @@ def main() -> None:
 
     # the predictor is conditioned on the CLAP embedding of the target, and the dataset holds far
     # fewer distinct targets than rows, so they are embedded once up front
-    target_embeds = {target: clap.encode_text([target]) for target in {row[1] for row in dataset.rows}}
+    target_embeds = {target: clap.encode_text([target]) for target in {pair["target"] for pair in evaluation_pairs}}
 
     rows: list[dict] = []
     alpha_runs: list[dict] = []
     samples_path = output_dir / "sample_metrics.csv"
     alpha_path = output_dir / "alpha_records.jsonl"
-    total_generations = len(dataset) * args.num_seeds * len(methods)
+    total_evaluations = len(evaluation_pairs) * (len(methods) + (1 if selection is not None else 0))
     completed = 0
 
     with samples_path.open("w", newline="", encoding="utf-8") as csv_file, alpha_path.open(
@@ -608,89 +954,152 @@ def main() -> None:
         writer = csv.DictWriter(csv_file, fieldnames=SAMPLE_FIELDS)
         writer.writeheader()
 
-        # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
-        # evaluating one prompt at a time keeps every saved schedule attributable to one prompt.
-        for sample_id, (prompt, target, retain_prompt) in enumerate(dataset.rows):
-            for seed_index in range(args.num_seeds):
-                sample_seed = args.seed + seed_index * len(dataset) + sample_id
-                for method_name, steering_model in methods.items():
-                    # Recreate the generator for every method so paired runs receive identical noise.
-                    generator = torch.Generator().manual_seed(sample_seed)
-                    with torch.inference_mode():
-                        output = pipe(
-                            prompt=prompt,
-                            retain_prompt=retain_prompt,
-                            target_embed=target_embeds[target],
-                            steering_model=steering_model,
-                            steering_frac_start=generation_config["steering_frac_start"],
-                            steering_frac_end=generation_config["steering_frac_end"],
-                            train=False,
-                            num_inference_steps=generation_config["num_inference_steps"],
-                            audio_length_in_s=generation_config["audio_length_in_s"],
-                            cfg_scale=generation_config["cfg_scale"],
-                            apg_scale=generation_config["apg_scale"],
-                            generator=generator,
-                            output_type="pt",
-                        )
-                        # `(1, channels, samples)`; CLAP's audio tower is mono, so the channels are
-                        # summed to a mid signal for scoring while the saved file stays stereo
-                        waveform_tensor = output.audios.to(device)
-                        audio_embeds = clap.encode_audio(waveform_tensor.mean(dim=1), sampling_rate)
-                        target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
-                        prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
-                        retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
+        # Batch size is intentionally one. In selection mode the base row is scored from the exact
+        # saved WAV, while every steered method recreates a CPU generator with that record's seed.
+        for pair in evaluation_pairs:
+            pair_id = pair["pair_id"]
+            sample_id = int(pair["sample_id"])
+            seed_index = int(pair["seed_index"])
+            sample_seed = int(pair["seed"])
+            prompt = pair["prompt"]
+            target = pair["target"]
+            retain_prompt = pair["retain_prompt"]
+            metadata = baseline_metadata(pair["baseline_record"], pair["baseline_audio_path"])
 
-                    waveform = waveform_tensor[0].detach().float().cpu().numpy()
-                    signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
-                    records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
-                    alpha_stats = alpha_metrics(records)
-
-                    audio_relative_path = ""
-                    if args.save_audio:
-                        audio_relative_path = str(
-                            Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
-                        )
-                        save_waveform(output_dir / audio_relative_path, waveform, sampling_rate)
-
-                    row = {
-                        "sample_id": sample_id,
-                        "seed_index": seed_index,
-                        "seed": sample_seed,
-                        "method": method_name,
-                        "prompt": prompt,
-                        "target": target,
-                        "retain_prompt": retain_prompt,
-                        "audio_path": audio_relative_path,
-                        "target_similarity": target_similarity,
-                        "prompt_similarity": prompt_similarity,
-                        "retain_similarity": retain_similarity,
-                        **signal,
-                        **alpha_stats,
-                    }
-                    rows.append(row)
-                    writer.writerow(row)
-                    csv_file.flush()
-
-                    alpha_run = {
-                        "sample_id": sample_id,
-                        "seed_index": seed_index,
-                        "seed": sample_seed,
-                        "method": method_name,
-                        "records": records,
-                    }
-                    alpha_runs.append(alpha_run)
-                    alpha_file.write(json.dumps(alpha_run) + "\n")
-                    alpha_file.flush()
-
-                    completed += 1
-                    print(
-                        f"[{completed}/{total_generations}] sample={sample_id} seed={sample_seed} method={method_name} "
-                        f"target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
-                        f"prompt_cos={prompt_similarity:+.4f}",
-                        flush=True,
+            if selection is not None:
+                waveform, baseline_rate = load_waveform(pair["baseline_audio_path"])
+                if baseline_rate != sampling_rate:
+                    raise ValueError(
+                        f"saved baseline {pair['baseline_audio_path']} has sample rate {baseline_rate},"
+                        f" expected {sampling_rate}"
                     )
+                target_similarity, prompt_similarity, retain_similarity = score_waveform_with_clap(
+                    waveform, sampling_rate, clap, device, prompt, target, retain_prompt
+                )
+                signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
+                records = []
+                audio_relative_path = ""
+                if args.save_audio:
+                    audio_relative_path = str(
+                        Path("audio") / "base" / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
+                    )
+                    copied_path = output_dir / audio_relative_path
+                    copied_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(pair["baseline_audio_path"], copied_path)
 
-    summary = summarize(rows, args.bootstrap_samples, args.seed)
+                row = {
+                    "pair_id": pair_id,
+                    "sample_id": sample_id,
+                    "seed_index": seed_index,
+                    "seed": sample_seed,
+                    "method": "base",
+                    "prompt": prompt,
+                    "target": target,
+                    "retain_prompt": retain_prompt,
+                    "audio_path": audio_relative_path,
+                    **metadata,
+                    "target_similarity": target_similarity,
+                    "prompt_similarity": prompt_similarity,
+                    "retain_similarity": retain_similarity,
+                    **signal,
+                    **alpha_metrics(records),
+                }
+                rows.append(row)
+                writer.writerow(sample_row_to_csv(row))
+                alpha_run = {
+                    "pair_id": pair_id,
+                    "sample_id": sample_id,
+                    "seed_index": seed_index,
+                    "seed": sample_seed,
+                    "method": "base",
+                    "records": records,
+                }
+                alpha_runs.append(alpha_run)
+                alpha_file.write(json.dumps(alpha_run) + "\n")
+                completed += 1
+                print(
+                    f"[{completed}/{total_evaluations}] pair={pair_id} method=base(saved) "
+                    f"target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
+                    f"prompt_cos={prompt_similarity:+.4f}",
+                    flush=True,
+                )
+
+            for method_name, steering_model in methods.items():
+                generator = torch.Generator().manual_seed(sample_seed)
+                with torch.inference_mode():
+                    output = pipe(
+                        prompt=prompt,
+                        retain_prompt=retain_prompt,
+                        target_embed=target_embeds[target],
+                        steering_model=steering_model,
+                        steering_frac_start=generation_config["steering_frac_start"],
+                        steering_frac_end=generation_config["steering_frac_end"],
+                        train=False,
+                        num_inference_steps=generation_config["num_inference_steps"],
+                        audio_length_in_s=generation_config["audio_length_in_s"],
+                        cfg_scale=generation_config["cfg_scale"],
+                        negative_prompt=generation_config["negative_prompt"],
+                        apg_scale=generation_config["apg_scale"],
+                        generator=generator,
+                        chunked_decode=generation_config["chunked_decode"],
+                        output_type="pt",
+                    )
+                waveform = output.audios[0].detach().float().cpu().numpy()
+                target_similarity, prompt_similarity, retain_similarity = score_waveform_with_clap(
+                    waveform, sampling_rate, clap, device, prompt, target, retain_prompt
+                )
+                signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
+                records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
+
+                audio_relative_path = ""
+                if args.save_audio:
+                    audio_relative_path = str(
+                        Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
+                    )
+                    save_waveform(output_dir / audio_relative_path, waveform, sampling_rate)
+
+                row = {
+                    "pair_id": pair_id,
+                    "sample_id": sample_id,
+                    "seed_index": seed_index,
+                    "seed": sample_seed,
+                    "method": method_name,
+                    "prompt": prompt,
+                    "target": target,
+                    "retain_prompt": retain_prompt,
+                    "audio_path": audio_relative_path,
+                    **metadata,
+                    "target_similarity": target_similarity,
+                    "prompt_similarity": prompt_similarity,
+                    "retain_similarity": retain_similarity,
+                    **signal,
+                    **alpha_metrics(records),
+                }
+                rows.append(row)
+                writer.writerow(sample_row_to_csv(row))
+                csv_file.flush()
+
+                alpha_run = {
+                    "pair_id": pair_id,
+                    "sample_id": sample_id,
+                    "seed_index": seed_index,
+                    "seed": sample_seed,
+                    "method": method_name,
+                    "records": records,
+                }
+                alpha_runs.append(alpha_run)
+                alpha_file.write(json.dumps(alpha_run) + "\n")
+                alpha_file.flush()
+
+                completed += 1
+                print(
+                    f"[{completed}/{total_evaluations}] pair={pair_id} method={method_name} "
+                    f"target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
+                    f"prompt_cos={prompt_similarity:+.4f}",
+                    flush=True,
+                )
+
+    summary = summarize(rows, args.bootstrap_samples, summary_seed)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     plot_target_similarity(summary, output_dir / "target_similarity.png")
     plot_tradeoff(summary, output_dir / "suppression_fidelity_tradeoff.png")
