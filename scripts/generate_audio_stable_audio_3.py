@@ -1,12 +1,6 @@
 r"""
 Generates audio with Stable Audio 3 for a list of prompts.
 
-Same job as `scripts/generate_audio_stable_audio.py`, but Stable Audio 3 is not supported by diffusers:
-it ships its own library, `stable_audio_3`, whose `StableAudioModel` replaces `StableAudioPipeline`. Like
-the other generation scripts this one never touches any steering component, it is plain text-to-audio
-generation, which makes it the unsteered reference `scripts/evaluate.py` results can be sanity-checked
-against.
-
 The `stabilityai/stable-audio-3-*` weights are gated: accept the Stability AI Community License and the
 Gemma Terms of Use on the model page, then authenticate with `hf auth login` or an `HF_TOKEN` variable.
 

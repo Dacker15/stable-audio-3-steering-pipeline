@@ -55,5 +55,3 @@ See [EVALUATION.md](EVALUATION.md) for the full paired evaluation workflow.
 
 `scripts/generate_audio_stable_audio_3.py` generates with the stock Stable Audio 3, which is the
 unsteered reference the evaluation can be sanity-checked against.
-`scripts/generate_audio_stable_audio.py` (Stable Audio Open 1.0) and `scripts/generate_audio.py`
-(MusicLDM, the backbone this project used before the migration) are kept as historical baselines.

@@ -6,9 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.14.0",
-    # only `scripts/generate_audio.py` (the MusicLDM baseline) and
-    # `scripts/generate_audio_stable_audio.py` (Stable Audio Open 1.0) still use diffusers; Stable
-    # Audio 3 is not supported by it and ships its own library instead
     "diffusers>=0.39.0",
     "einops>=0.8.2",
     "huggingface-hub>=1.7.1",
