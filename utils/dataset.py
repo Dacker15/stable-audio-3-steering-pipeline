@@ -56,7 +56,7 @@ def strip_target(prompt: str, target: str) -> str:
 
 class PromptTargetDataset(Dataset):
     r"""
-    Reads the prompt CSV consumed by `SteeringStableAudioPipeline`.
+    Reads the prompt CSV consumed by `SteeringAceStepPipeline`.
 
     A CSV may contain either `prompt,target` or `prompt,target,retain_prompt`. An explicit
     `retain_prompt` is used as written (apart from surrounding whitespace); the two-column format

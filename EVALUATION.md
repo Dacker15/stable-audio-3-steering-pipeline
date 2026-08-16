@@ -1,50 +1,20 @@
 # Evaluation pipeline
 
-`scripts/evaluate.py` evaluates checkpoints
+`scripts/evaluate.py` compares the learned ACE-Step 1.5 SFT controller with a paired `alpha=0`
+baseline and optional fixed-alpha controls. Every method starts from identical latent noise for each
+prompt/seed pair.
 
-## What it compares
+## Recommended workflow
 
-Every prompt/seed pair is generated with identical initial noise under:
-
-- `base`: constant `alpha=0`, exactly preserving full-prompt CFG;
-- `learned`: the `SteeringPredictor` loaded from the checkpoint, interpolating from full-prompt CFG
-  towards retain-prompt CFG;
-- optional fixed-alpha controls supplied through `--fixed-alphas`.
-
-Evaluation runs with batch size one because the current pipeline records alpha averaged across the batch. This makes each recorded schedule belong unambiguously to one prompt.
-
-## Before running
-
-For a reportable suppression experiment, first use
-[`scripts/prepare_baselines_stable_audio_3.py`](BASELINE_SELECTION.md) to verify that each preassigned
-target is present in its paired `alpha=0` prompt/seed baseline. This prevents an absent baseline
-target from being counted as successful suppression. The selector also records which retain
-instruments were present.
-
-The preferred evaluator input is now the selector output directory:
+Generate target-valid selections for train and validation with disjoint seed ranges, then train:
 
 ```powershell
-uv run python scripts/evaluate.py `
-  --baseline-selection outputs/trumpet-baseline-selection `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/eval-selected
-```
-
-This mode evaluates only target-valid records, uses their explicit seeds, takes paired generation
-settings from the selector config, and scores the exact saved WAV as `base`. Conflicting settings are
-rejected rather than silently creating an unpaired comparison. The legacy `--dataset`, `--num-seeds`
-and `--seed` mode remains supported for diagnostics.
-
-First produce target-valid paired-alpha0 selections for the training and validation splits, using
-different numeric seed ranges, then train from those manifests:
-
-```powershell
-uv run python scripts/prepare_baselines_stable_audio_3.py `
+uv run python scripts/prepare_baselines_ace_step.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
   --output outputs/trumpet-train-baselines `
   --baseline-mode paired-alpha0 --num-seeds 3 --seed 1000
 
-uv run python scripts/prepare_baselines_stable_audio_3.py `
+uv run python scripts/prepare_baselines_ace_step.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
   --output outputs/trumpet-validation-baselines `
   --baseline-mode paired-alpha0 --num-seeds 3 --seed 100000
@@ -55,125 +25,75 @@ uv run python scripts/train.py `
   --output outputs/trumpet-target-specific
 ```
 
-The best checkpoint is selected by validation loss. It records hashes and metadata for both
-selection manifests and datasets, their target/seed counts, the complete generation configuration,
-optimizer settings, target vocabulary, training metrics and validation metrics. Legacy `--dataset`
-training remains supported, but selects by training loss because it has no held-out selection.
-
-Create the group-aware splits first with:
+For final evaluation, first select target-valid baselines from the held-out test split:
 
 ```powershell
-uv run python scripts/create_simple_splits.py `
-  --input datasets/trumpet_prompts_simple_dataset.csv `
-  --output-dir datasets/trumpet_simple_splits `
-  --seed 42
+uv run python scripts/prepare_baselines_ace_step.py `
+  --dataset datasets/trumpet_simple_splits/test.csv `
+  --output outputs/trumpet-test-baselines `
+  --baseline-mode paired-alpha0 --num-seeds 5 --seed 200000
+
+uv run python scripts/evaluate.py `
+  --baseline-selection outputs/trumpet-test-baselines `
+  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --output outputs/eval-final `
+  --fixed-alphas 0.25 0.5 0.75 1.0
 ```
 
-The split contains 132/44/44 train/validation/test rows. The two templates that share a genre and
-accompaniment are assigned together, preventing their near-duplicate pair from leaking across splits.
+Selection mode evaluates only target-valid records, uses their explicit seeds, and scores the exact
+saved baseline WAV as `base`. Model, precision, step count, duration, CFG scale, timestep shift, and
+steering window are checked against the training checkpoint. Conflicting overrides are rejected.
 
-For reportable results, evaluate a held-out CSV that was not used for either training or checkpoint
-selection. The evaluator checks the evaluation path against both dataset paths stored in new
-checkpoints and writes a leakage warning when it matches the training or validation split. Reusing
-either remains useful as a diagnostic, but does not measure held-out test generalization.
-
-The preferred CSV contract contains an explicit retain prompt:
-
-```csv
-prompt,target,retain_prompt
-"A jazz piece featuring bright trumpet and swung drums","trumpet","A jazz piece featuring swung drums"
-```
-
-Legacy `prompt,target` CSV files remain supported; in that case the retain prompt is derived by
-lexically removing the target. An explicit `retain_prompt` is always preferred.
-
-## Smoke test
-
-This checks the end-to-end evaluator with a small workload. Eight denoising steps are useful only
-for checking that the machinery works; they are not comparable to a full 50-step evaluation.
+The legacy `--dataset`, `--num-seeds`, and `--seed` path remains useful for diagnostics. For a small
+plumbing check:
 
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
   --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
   --output outputs/eval-smoke `
-  --max-samples 4 `
-  --num-seeds 1 `
-  --num-inference-steps 8
+  --max-samples 4 --num-seeds 1 --num-inference-steps 8
 ```
 
-## Final paired evaluation
+Eight steps are only a software smoke test; the SFT checkpoint's normal setting is 50 steps.
 
-Use multiple seeds and include fixed-alpha controls to test whether the learned schedule improves
-over a constant intervention:
+## Compared methods
 
-```powershell
-uv run python scripts/evaluate.py `
-  --dataset datasets/trumpet_simple_splits/test.csv `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/eval-final `
-  --num-seeds 5 `
-  --fixed-alphas 0.25 0.5 0.75 1.0
-```
+- `base`: fixed `alpha=0`, preserving complete-prompt APG;
+- `learned`: the trained per-step predictor;
+- `fixed_alpha_*`: optional constant controls from `--fixed-alphas`.
 
-For a target-valid final evaluation, prefer the selection-driven equivalent:
+Evaluation uses batch size one so each recorded alpha schedule belongs to one prompt. `alpha=1`
+fully selects retain-prompt APG within the steering window; outside the window all methods follow the
+complete prompt.
 
-```powershell
-uv run python scripts/evaluate.py `
-  --baseline-selection outputs/trumpet-baseline-selection `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/eval-final-selected `
-  --fixed-alphas 0.25 0.5 0.75 1.0
-```
+## Configuration contract
 
-Checkpoints whose `steering_mode` does not match the evaluator's are intentionally rejected. That
-covers the previous global-CFG formula, whose `alpha` values have a different meaning, and every
-checkpoint trained against MusicLDM, which does not share a latent space with Stable Audio 3.
+The only accepted backbone is `ACE-Step/acestep-v15-sft`. The important generation controls are:
 
-Generation settings default to those stored in the checkpoint and can be overridden with:
-
-- `--model`, which has to name a `-base` checkpoint;
-- `--num-inference-steps`;
-- `--audio-length-in-s`;
-- `--cfg-scale` and `--apg-scale`;
+- `--num-inference-steps` (50 by default);
+- `--audio-length-in-s` (10–600 seconds; experiments default to 10 for CLAP coverage);
+- `--cfg-scale` (7 by default and greater than 1 for steering);
+- `--shift` (1 by default for SFT);
 - `--steering-frac-start` and `--steering-frac-end`.
 
-That override rule applies to legacy `--dataset` mode. With `--baseline-selection`, model, step count,
-duration, CFG/APG, negative prompt, precision and decode mode are inherited from the saved baselines;
-the steering window must also match both the selection and the checkpoint that was trained from it.
-A conflicting paired-setting override is rejected.
+CUDA loads the DiT/text encoder in BF16 unless `--no-half` is used. The Euler trajectory and VAE
+decoder stay float32. Output is 48 kHz stereo; CLAP scores the mono channel average.
 
-The diffusion transformer is loaded in half precision unless `--no-half` is passed; the latent
-trajectory, the guidance algebra and the autoencoder are always float32. Audio saving can be disabled
-with `--no-save-audio`, although paired listening is strongly recommended. Saved clips are stereo at
-44.1 kHz; CLAP scores a mono downmix of them, since its audio tower is mono.
-
-An existing non-empty output directory is never replaced accidentally. Pass `--replace-output`
-only when the named evaluation directory may be removed and recreated.
+Checkpoints carry a versioned `steering_mode`. Predictors trained for Stable Audio 3, MusicLDM, an
+older guidance formula, or a different latent layout are deliberately rejected.
 
 ## Metrics
 
-For each generated waveform the evaluator records:
+For each waveform the evaluator records:
 
-- `target_similarity`: CLAP cosine similarity between audio and target; lower is better;
-- `retain_similarity`: CLAP cosine similarity between audio and the explicit retain prompt, or the
-  fallback produced by `utils.strip_target` for legacy datasets; higher is better, and this is the
-  term `scripts/train.py` optimizes alongside suppression;
-- `prompt_similarity`: CLAP cosine similarity between audio and the full prompt;
-- RMS, peak, near-silence ratio and clipping ratio;
-- alpha mean, standard deviation, minimum and maximum;
-- fraction of steered steps with `alpha > 0.5`, where the interpolation weight assigned to
-  retain-prompt guidance is larger than the weight assigned to full-prompt guidance.
+- `target_similarity`: CLAP audio/target cosine similarity; lower is better;
+- `retain_similarity`: CLAP audio/retain-prompt similarity; higher is better;
+- `prompt_similarity`: CLAP audio/full-prompt similarity;
+- RMS, peak, near-silence ratio, and clipping ratio;
+- alpha mean, standard deviation, minimum, maximum, and retain-dominant ratio.
 
-With `--baseline-selection`, every method row additionally records the baseline classifier's target
-score, requested and retain instruments, per-retain score/validity, and the lists
-`baseline_valid_retain_instruments` / `baseline_invalid_retain_instruments`. A retain instrument that
-was absent before steering is not evidence of collateral damage; the global CLAP retain score remains
-available as a prompt-level diagnostic. `summary.json` additionally reports
-`retain_similarity_change_all_retain_baseline_valid` for the clean subset where every requested retain
-instrument was detected in the baseline.
-
-Paired metrics compare a method with `base` for the same prompt and seed:
+Paired changes are calculated within the same prompt and seed:
 
 ```text
 target suppression gain  = target_similarity(base) - target_similarity(method)
@@ -181,27 +101,15 @@ retain similarity change = retain_similarity(method) - retain_similarity(base)
 prompt similarity change = prompt_similarity(method) - prompt_similarity(base)
 ```
 
-A positive suppression gain is desirable, and the trade-off plot reads it against the retain
-similarity change: a large gain paired with a negative retain change usually means the audio was
-degraded rather than the concept removed.
+A positive suppression gain is desirable. A large gain combined with a strongly negative retain
+change usually indicates degraded audio rather than selective instrument removal. Selection mode
+also propagates the independent classifier's target and retain-instrument scores. Confidence
+intervals bootstrap prompts, after averaging multiple seeds within a prompt.
 
-Prompt-similarity change is only a coarse fidelity proxy: in the current dataset the full prompt
-includes the target word `trumpet`, so suppressing the target and matching the full prompt are
-partially conflicting objectives. Explicit retain prompts remove that conflict more cleanly. For
-legacy two-column datasets the fallback derivation is lexical, so modifiers of the target survive it
-(`"muted trumpet with a plunger mute"` becomes `"muted with a plunger mute"`).
-
-Confidence intervals use prompts as the independent units. Results from multiple seeds are averaged
-within each prompt before bootstrap resampling, avoiding artificially narrow intervals from treating
-seeds of the same prompt as independent observations.
-
-CLAP is also used by training, so these metrics must be complemented by paired listening and,
-eventually, an independent instrument classifier. RMS, silence and clipping are sanity checks rather
-than perceptual-quality metrics.
+CLAP is also used during training, so report these numbers together with the independent instrument
+classifier and paired listening.
 
 ## Outputs
-
-The evaluation directory contains:
 
 ```text
 config.json
@@ -218,7 +126,5 @@ audio/
   fixed_alpha_*/
 ```
 
-`sample_metrics.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
-contains prompt-clustered bootstrap confidence intervals, while `report.md` provides the compact
-human-readable summary. In selection mode `audio/base/` contains exact copies of the saved selector
-baselines rather than regenerated clips.
+In selection mode `audio/base/` contains copies of the saved selector baselines. A non-empty output
+directory is never overwritten unless `--replace-output` is explicitly passed.

@@ -1,21 +1,35 @@
-# Stable Audio 3 Steering Pipeline
+# ACE-Step 1.5 SFT Steering Pipeline
 
-The current experiment learns target-specific steering for one instrument (`trumpet`) by
-interpolating between full-prompt and retain-prompt classifier-free guidance.
+This project learns target-specific instrument steering (currently `trumpet`) by interpolating at
+every active denoising step between:
 
-Stable Audio 3 is not supported by diffusers, so the steering is not a pipeline subclass: it
-overrides `DiffusionTransformer.forward`, the component of the `stable_audio_3` library where
-classifier-free guidance is actually computed. See `pipelines/steering_stable_audio_pipeline.py`.
+- ACE-Step APG for the complete prompt (`alpha=0`), and
+- ACE-Step APG for the retain prompt with the target removed (`alpha=1`).
 
-Only the `-base` checkpoints work. The post-trained ones (`small-music`, `medium`, `small-sfx`) are
-distilled and ignore `cfg_scale`, and steering lives inside the guidance branch. The default is
-`medium-base`; `small-music-base` is the lighter fallback. Both are gated on HuggingFace, so accept
-the licence on the model page and authenticate with `hf auth login` or an `HF_TOKEN` variable first.
+The backbone is pinned to the official 2B checkpoint `ACE-Step/acestep-v15-sft`. The loader rejects
+all other variants. In particular it does **not** use `acestep-v15-base`, which is the checkpoint
+that supports Extract/Lego/Complete, nor Turbo, whose distilled path has no CFG branch. Generation
+uses text-to-music only: no extractor, source-audio editing, or 5 Hz language-model planner.
+
+The implementation is in `pipelines/steering_ace_step_pipeline.py`. It loads the SFT DiT and its
+official shared Qwen3 embedding encoder, silence latent, and Oobleck VAE. The standard defaults are
+50 Euler steps, CFG/APG scale 7, timestep shift 1, 48 kHz stereo, and 10-second clips.
+
+## Install
+
+```powershell
+uv sync
+```
+
+Use Python 3.11 or 3.12. On 64-bit Windows the lockfile installs the ACE-Step-compatible
+PyTorch/torchaudio 2.7.1 CUDA 12.8 pair. The first model-backed command downloads the public
+ACE-Step weights from Hugging Face. CUDA uses the checkpoint's native BF16; `--no-half` selects
+float32. The differentiable latent trajectory and VAE decoder remain float32 during training.
 
 ## Prepare the simplified dataset
 
 Place `trumpet_prompts_simple_dataset.csv` in `datasets/`, then create deterministic group-aware
-splits. Each pair of equivalent prompt templates stays in the same split.
+splits. Equivalent prompt templates remain in the same split.
 
 ```powershell
 uv run python scripts/create_simple_splits.py `
@@ -24,21 +38,37 @@ uv run python scripts/create_simple_splits.py `
   --seed 42
 ```
 
-This creates 132 training rows, 44 validation rows and 44 test rows.
+This creates 132 training rows, 44 validation rows, and 44 test rows.
+
+### Larger two-instrument dataset
+
+`datasets/trumpet_simple_splits_big` contains a 440-prompt alternative. Every prompt is an explicit
+duet: trumpet plus exactly one retain instrument. Its group-aware split contains 264/88/88
+train/validation/test rows while paired templates remain confined to one split.
+
+The committed files can be regenerated with:
+
+```powershell
+uv run python scripts/create_big_trumpet_dataset.py --overwrite
+
+uv run python scripts/create_simple_splits.py `
+  --input datasets/trumpet_prompts_simple_dataset_big.csv `
+  --output-dir datasets/trumpet_simple_splits_big `
+  --seed 42 --overwrite
+```
 
 ## Train
 
-First generate paired `alpha=0` baselines on the training and validation splits. These calls use
-different seed ranges, and only records where the preassigned target is detected will be consumed by
-training:
+First generate paired `alpha=0` baselines for training and validation. Only records where the
+preassigned target is detected by the independent AudioSet classifier are consumed by training.
 
 ```powershell
-uv run python scripts/prepare_baselines_stable_audio_3.py `
+uv run python scripts/prepare_baselines_ace_step.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
   --output outputs/trumpet-train-baselines `
   --baseline-mode paired-alpha0 --num-seeds 3 --seed 1000
 
-uv run python scripts/prepare_baselines_stable_audio_3.py `
+uv run python scripts/prepare_baselines_ace_step.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
   --output outputs/trumpet-validation-baselines `
   --baseline-mode paired-alpha0 --num-seeds 3 --seed 100000
@@ -49,58 +79,42 @@ uv run python scripts/train.py `
   --output outputs/trumpet-target-specific
 ```
 
-`alpha` starts at `0.15`: `0` follows full-prompt guidance and `1` follows retain-prompt guidance.
-Both selections must use identical model/generation/classifier settings, disjoint dataset groups and
-disjoint seed values. The training loader contains only target-valid prompt/seed pairs. Validation
-runs on its fixed held-out pairs after every epoch and `steering_predictor_best.pt` is selected by
-validation loss. CLAP is loaded on its own — Stable Audio 3 conditions on T5Gemma — and provides
-both the loss and the target embedding the predictor is conditioned on.
+Both selections must have identical generation/classifier settings and disjoint dataset groups and
+seeds. `alpha` initializes at `0.15`. CLAP supplies both the suppression/retention loss and the target
+embedding that conditions the predictor; ACE-Step itself uses Qwen3 for prompt conditioning. The
+best checkpoint is selected by fixed held-out validation loss.
 
-The historical `--dataset` training mode remains available for compatibility, but has no target-valid
-validation selection and therefore falls back to choosing the best checkpoint by training loss.
+The historical `--dataset` training mode remains available, but it has no target-valid validation
+selection and therefore selects by training loss.
 
 ## Evaluate
 
-```powershell
-uv run python scripts/evaluate.py `
-  --dataset datasets/trumpet_simple_splits/validation.csv `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/trumpet-target-specific-validation
-```
-
-See [EVALUATION.md](EVALUATION.md) for the full paired evaluation workflow.
-
-## Select valid prompt/seed baselines
-
-Before a suppression evaluation, generate paired `alpha=0` baselines and verify that the target
-assigned by the dataset is actually audible according to an independent multi-label AudioSet
-classifier:
+Prepare target-valid test baselines, then evaluate those exact prompt/seed pairs:
 
 ```powershell
-uv run python scripts/prepare_baselines_stable_audio_3.py `
+uv run python scripts/prepare_baselines_ace_step.py `
   --dataset datasets/trumpet_simple_splits/test.csv `
   --output outputs/trumpet-baseline-selection `
   --num-seeds 5 --seed 200000
-```
 
-The target is fixed from the CSV before classification. Only prompt/seed pairs where it is detected
-are written to `eligible_pairs.csv`; complete scores, invalid pairs, requested instruments, retain
-instrument validity and saved baseline audio remain in the full manifests. See
-[BASELINE_SELECTION.md](BASELINE_SELECTION.md) for the schema, thresholding, exact/proxy AudioSet
-labels, and the same-seed contract used by the integrated paired baseline/steering evaluation.
-
-Evaluate those exact target-valid pairs with:
-
-```powershell
 uv run python scripts/evaluate.py `
   --baseline-selection outputs/trumpet-baseline-selection `
   --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/trumpet-eval-selected
+  --output outputs/trumpet-eval-selected `
+  --fixed-alphas 0.25 0.5 0.75 1.0
 ```
+
+See [BASELINE_SELECTION.md](BASELINE_SELECTION.md) for selection semantics and
+[EVALUATION.md](EVALUATION.md) for metrics, controls, and outputs. Old Stable Audio 3 and MusicLDM
+predictor checkpoints are intentionally incompatible and must be retrained.
 
 ## Plain generation
 
-`scripts/generate_audio_stable_audio_3.py` generates with the stock Stable Audio 3, which is the
-unsteered reference the evaluation can be sanity-checked against.
+```powershell
+uv run python scripts/generate_audio_ace_step.py `
+  --prompt "A laid-back jazz trumpet solo over walking bass" `
+  --output outputs/generated
+```
+
 `scripts/generate_audio_stable_audio.py` (Stable Audio Open 1.0) and `scripts/generate_audio.py`
-(MusicLDM, the backbone this project used before the migration) are kept as historical baselines.
+(MusicLDM) remain only as historical baselines.

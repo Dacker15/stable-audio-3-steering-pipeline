@@ -12,7 +12,7 @@ from utils.dataset import strip_target
 
 
 DEFAULT_CLASSIFIER_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
-BASELINE_SCHEMA_VERSION = 1
+BASELINE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)

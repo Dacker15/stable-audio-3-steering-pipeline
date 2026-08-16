@@ -1,7 +1,7 @@
 r"""
 Generates audio with the stock `MusicLDMPipeline` for a list of prompts.
 
-MusicLDM is no longer the backbone of this project, which has moved to Stable Audio 3; this script is
+MusicLDM is no longer the backbone of this project, which has moved to ACE-Step 1.5 SFT; this script is
 kept as the historical baseline the earlier results were produced with. It never touches any steering
 component: there is no steering target, predictor or steering window, just plain text-to-audio
 generation.

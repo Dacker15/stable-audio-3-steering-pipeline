@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.create_simple_splits import assign_splits, create_splits, read_dataset
+from scripts.create_big_trumpet_dataset import RETAIN_INSTRUMENTS, STYLES, build_rows
 
 
 class CreateSimpleSplitsTests(unittest.TestCase):
@@ -119,6 +120,38 @@ class CreateSimpleSplitsTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "expected|accompaniment|genres"):
                 assign_splits(rows, seed=42)
+
+    def test_big_dataset_doubles_rows_and_keeps_exactly_two_declared_instruments(self) -> None:
+        rows = build_rows()
+
+        self.assertEqual(len(rows), 440)
+        self.assertEqual(len(STYLES), 44)
+        self.assertEqual(len({row["prompt"] for row in rows}), 440)
+        for row in rows:
+            self.assertNotRegex(row["prompt"], r"^A (?:ambient|americana|art|indie|alternative|upbeat)\b")
+            self.assertEqual(row["target"], "trumpet")
+            requested = row["requested_instruments"].split("; ")
+            self.assertEqual(len(requested), 2)
+            self.assertEqual(requested[0], "trumpet")
+            self.assertIn(requested[1], RETAIN_INSTRUMENTS)
+            self.assertEqual(row["retain_instruments"], requested[1])
+            self.assertNotIn("trumpet", row["retain_prompt"].casefold())
+
+        splits = assign_splits(rows, seed=42)
+        self.assertEqual({name: len(split) for name, split in splits.items()}, {
+            "train": 264,
+            "validation": 88,
+            "test": 88,
+        })
+        self.assertTrue(
+            all({row["retain_instruments"] for row in split_rows} == set(RETAIN_INSTRUMENTS)
+                for split_rows in splits.values())
+        )
+        group_splits: dict[str, set[str]] = defaultdict(set)
+        for split_name, split_rows in splits.items():
+            for row in split_rows:
+                group_splits[row["group_id"]].add(split_name)
+        self.assertTrue(all(len(names) == 1 for names in group_splits.values()))
 
 
 if __name__ == "__main__":

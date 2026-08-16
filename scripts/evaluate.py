@@ -1,5 +1,5 @@
 r"""
-Evaluates a trained ``SteeringPredictor`` against its paired ``alpha=0`` Stable Audio 3 baseline.
+Evaluates a trained ``SteeringPredictor`` against its paired ``alpha=0`` ACE-Step 1.5 SFT baseline.
 
 Example smoke test (using a checkpoint produced by ``scripts/train.py``):
 
@@ -39,17 +39,23 @@ import torch
 from torch import nn
 
 from losses import ClapLoss
-from pipelines import FixedAlphaSteering, STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
+from pipelines import (
+    ACE_STEP_MODEL_ID,
+    FixedAlphaSteering,
+    STEERING_MODE,
+    SteeringAceStepPipeline,
+    SteeringPredictor,
+)
 from utils import PromptTargetDataset, load_waveform, save_waveform
 from utils.instrument_classification import BaselineSelection, load_baseline_selection
 
 
-MODEL = "medium-base"
+MODEL = ACE_STEP_MODEL_ID
 FALLBACK_GENERATION_CONFIG = {
     "num_inference_steps": 50,
     "audio_length_in_s": 10.0,
     "cfg_scale": 7.0,
-    "apg_scale": 0.0,
+    "shift": 1.0,
     "steering_frac_start": 0.3,
     "steering_frac_end": 0.8,
 }
@@ -99,7 +105,7 @@ PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a SteeringPredictor with paired Stable Audio 3 generations.",
+        description="Evaluate a SteeringPredictor with paired ACE-Step 1.5 SFT generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -115,7 +121,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "output directory (or baseline_records.jsonl) from prepare_baselines_stable_audio_3.py; "
+            "output directory (or baseline_records.jsonl) from prepare_baselines_ace_step.py; "
             "evaluates only target-valid pairs with their explicit seeds and saved baselines"
         ),
     )
@@ -144,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     generation = parser.add_argument_group("generation")
-    generation.add_argument("--model", default=None, help="Stable Audio 3 `-base` checkpoint, defaults to the one trained against")
+    generation.add_argument("--model", default=None, choices=(ACE_STEP_MODEL_ID,), help="ACE-Step SFT checkpoint")
     generation.add_argument(
         "--num-seeds",
         type=int,
@@ -160,19 +166,7 @@ def parse_args() -> argparse.Namespace:
     generation.add_argument("--num-inference-steps", type=int, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--audio-length-in-s", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--cfg-scale", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--apg-scale", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument(
-        "--negative-prompt",
-        type=str,
-        default=None,
-        help="must match the baseline-selection setting in selection mode",
-    )
-    generation.add_argument(
-        "--chunked-decode",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="must match the baseline-selection setting; defaults to disabled in legacy dataset mode",
-    )
+    generation.add_argument("--shift", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--steering-frac-start", type=float, default=None, help="defaults to checkpoint setting")
     generation.add_argument("--steering-frac-end", type=float, default=None, help="defaults to checkpoint setting")
 
@@ -181,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument(
         "--no-half",
         action="store_true",
-        help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
+        help="load the DiT/text encoder in float32 instead of CUDA BF16; the VAE always stays float32",
     )
     runtime.add_argument("--save-audio", action=argparse.BooleanOptionalAction, default=True)
     runtime.add_argument("--bootstrap-samples", type=int, default=10_000)
@@ -223,7 +217,7 @@ def resolve_generation_config(
     """Keeps saved-baseline settings fixed; legacy mode retains CLI/checkpoint fallback behaviour."""
 
     resolved = {}
-    paired_names = {"num_inference_steps", "audio_length_in_s", "cfg_scale", "apg_scale"}
+    paired_names = {"num_inference_steps", "audio_length_in_s", "cfg_scale", "shift"}
     for name, fallback in FALLBACK_GENERATION_CONFIG.items():
         cli_value = getattr(args, name)
         if baseline_generation is not None and name in paired_names:
@@ -238,34 +232,18 @@ def resolve_generation_config(
         else:
             resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
 
-    if baseline_generation is not None:
-        for name, cli_value, fallback in (
-            ("negative_prompt", args.negative_prompt, None),
-            ("chunked_decode", args.chunked_decode, False),
-        ):
-            baseline_value = baseline_generation.get(name, fallback)
-            if cli_value is not None and not _same_setting(cli_value, baseline_value):
-                raise ValueError(
-                    f"--{name.replace('_', '-')}={cli_value!r} does not match saved baseline value"
-                    f" {baseline_value!r}"
-                )
-            resolved[name] = baseline_value
-    else:
-        resolved["negative_prompt"] = args.negative_prompt
-        resolved["chunked_decode"] = False if args.chunked_decode is None else args.chunked_decode
-
     resolved["num_inference_steps"] = int(resolved["num_inference_steps"])
-    for name in ("audio_length_in_s", "cfg_scale", "apg_scale", "steering_frac_start", "steering_frac_end"):
+    for name in ("audio_length_in_s", "cfg_scale", "shift", "steering_frac_start", "steering_frac_end"):
         resolved[name] = float(resolved[name])
 
     if resolved["num_inference_steps"] < 1:
         raise ValueError("num_inference_steps must be at least 1")
-    if resolved["audio_length_in_s"] <= 0.0:
-        raise ValueError("audio_length_in_s must be positive")
+    if not 10.0 <= resolved["audio_length_in_s"] <= 600.0:
+        raise ValueError("audio_length_in_s must be in [10, 600]")
     if resolved["cfg_scale"] <= 1.0:
         raise ValueError("cfg_scale must exceed 1.0 because steering is applied inside the CFG branch")
-    if not 0.0 <= resolved["apg_scale"] <= 1.0:
-        raise ValueError("apg_scale must be in [0.0, 1.0]")
+    if resolved["shift"] <= 0.0:
+        raise ValueError("shift must be positive")
     start = resolved["steering_frac_start"]
     end = resolved["steering_frac_end"]
     if not 0.0 <= start < end <= 1.0:
@@ -300,13 +278,11 @@ def validate_checkpoint_selection_compatibility(checkpoint: dict, selection: Bas
     baseline_generation = selection.config["generation"]
     for name in (
         "model",
-        "model_half",
+        "model_dtype",
         "num_inference_steps",
         "audio_length_in_s",
         "cfg_scale",
-        "apg_scale",
-        "negative_prompt",
-        "chunked_decode",
+        "shift",
         "steering_frac_start",
         "steering_frac_end",
     ):
@@ -801,8 +777,8 @@ def main() -> None:
     if checkpoint["steering_mode"] != STEERING_MODE:
         raise ValueError(
             f"checkpoint {args.checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but this evaluator"
-            f" requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be evaluated on Stable Audio 3:"
-            " the two backbones do not share a latent space."
+            f" requires {STEERING_MODE!r}. Stable Audio 3 and MusicLDM checkpoints cannot be evaluated on"
+            " ACE-Step because the backbones do not share a latent space."
         )
     validate_checkpoint_selection_compatibility(checkpoint, selection)
     checkpoint_args = checkpoint.get("args", {})
@@ -820,19 +796,23 @@ def main() -> None:
 
     if selection is not None:
         if "model" not in baseline_generation:
-            raise ValueError("baseline-selection config is missing its Stable Audio 3 model")
+            raise ValueError("baseline-selection config is missing its ACE-Step model")
         baseline_model = str(baseline_generation["model"])
         if args.model is not None and args.model != baseline_model:
             raise ValueError(
                 f"--model={args.model!r} does not match the saved baseline model {baseline_model!r}"
             )
         model_name = baseline_model
-        model_half = bool(baseline_generation.get("model_half", True))
+        saved_model_dtype = str(baseline_generation.get("model_dtype", ""))
+        if saved_model_dtype not in {"bfloat16", "float32"}:
+            raise ValueError(f"unsupported or missing saved model_dtype {saved_model_dtype!r}")
+        model_half = saved_model_dtype == "bfloat16"
         if args.no_half and model_half:
-            raise ValueError("--no-half does not match the half-precision transformer used for the saved baselines")
+            raise ValueError("--no-half does not match the BF16 DiT used for the saved baselines")
     else:
         model_name = args.model or checkpoint.get("model") or MODEL
-        model_half = not args.no_half
+        trained_dtype = str(checkpoint.get("generation", {}).get("model_dtype", "bfloat16"))
+        model_half = not args.no_half and trained_dtype == "bfloat16"
 
     alpha_min = float(predictor_config.get("alpha_min", 0.0))
     alpha_max = float(predictor_config.get("alpha_max", 1.0))
@@ -844,6 +824,8 @@ def main() -> None:
 
     evaluation_pairs = build_evaluation_pairs(dataset, selection, args.seed, args.num_seeds)
     device = resolve_device(args.device)
+    if model_half and device.type != "cuda":
+        raise ValueError("a BF16 baseline/checkpoint requires CUDA; use the matching float32 artifacts on CPU")
     dataset_path = Path(selection.config["dataset"]) if selection is not None else args.dataset
     dataset_overlap_role = _dataset_overlap_role(dataset_path, checkpoint_args, checkpoint.get("data"))
     if dataset_overlap_role is not None:
@@ -884,7 +866,7 @@ def main() -> None:
         "same_dataset_as_validation": dataset_overlap_role == "validation",
         "dataset_overlap_role": dataset_overlap_role,
         "device": str(device),
-        "model_half": model_half,
+        "model_dtype": "bfloat16" if model_half else "float32",
         "fixed_alphas": args.fixed_alphas,
         "save_audio": args.save_audio,
         "silence_threshold": args.silence_threshold,
@@ -915,10 +897,9 @@ def main() -> None:
 
     if selection is not None:
         print(f"Loaded {len(evaluation_pairs)} target-valid prompt/seed pairs from {selection.records_path}")
-    print(f"Loading {model_name} on {device} with {'half' if model_half else 'float32'} precision")
-    pipe = SteeringStableAudioPipeline.from_pretrained(model_name, device=device, model_half=model_half)
-    pipe.diffusion.requires_grad_(False)
-    pipe.diffusion.eval()
+    print(f"Loading {model_name} on {device} with {'bfloat16' if model_half else 'float32'} precision")
+    pipe = SteeringAceStepPipeline.from_pretrained(model_name, device=device, model_half=model_half)
+    pipe.freeze_backbone()
 
     predictor = SteeringPredictor(**predictor_config).to(device)
     predictor.load_state_dict(checkpoint["state_dict"], strict=True)
@@ -1038,10 +1019,8 @@ def main() -> None:
                         num_inference_steps=generation_config["num_inference_steps"],
                         audio_length_in_s=generation_config["audio_length_in_s"],
                         cfg_scale=generation_config["cfg_scale"],
-                        negative_prompt=generation_config["negative_prompt"],
-                        apg_scale=generation_config["apg_scale"],
+                        shift=generation_config["shift"],
                         generator=generator,
-                        chunked_decode=generation_config["chunked_decode"],
                         output_type="pt",
                     )
                 waveform = output.audios[0].detach().float().cpu().numpy()

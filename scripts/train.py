@@ -1,5 +1,5 @@
 r"""
-Trains a `SteeringPredictor` to suppress a concept in `SteeringStableAudioPipeline` generations.
+Trains a `SteeringPredictor` to suppress a concept in `SteeringAceStepPipeline` generations.
 
 Each training step generates a full batch of waveforms with steering enabled, embeds them with the
 CLAP audio tower and scores them against two texts:
@@ -16,9 +16,9 @@ are both far from the target, and only the retain term tells them apart from a f
 the rest of the prompt.
 
 Gradients reach the predictor because the pipeline is called with `output_type="latent"`, which
-returns the trajectory endpoint before any decoding happens, and because the pipeline reimplements
-Stable Audio 3's sampling loop without the `torch.no_grad()` the library applies to it. The
-diffusion transformer itself still runs under `no_grad`, so the gradient flows to each `alpha_t`
+returns the trajectory endpoint before any decoding happens, and because the pipeline implements
+ACE-Step 1.5 SFT's Euler loop without detaching the trajectory. The DiT itself still runs under
+`no_grad`, so the gradient flows to each `alpha_t`
 through the Euler recurrence only. That is a first-order approximation of the true gradient and is
 what keeps the unrolled trajectory affordable.
 
@@ -50,7 +50,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
+from pipelines import ACE_STEP_MODEL_ID, STEERING_MODE, SteeringAceStepPipeline, SteeringPredictor
 from utils import PromptTargetDataset, collate_prompt_target
 from utils.instrument_classification import BaselineSelection, load_baseline_selection
 
@@ -135,6 +135,10 @@ def _same_setting(left, right) -> bool:
     return left == right
 
 
+def model_dtype_name(no_half: bool) -> str:
+    return "bfloat16" if not no_half and torch.cuda.is_available() else "float32"
+
+
 def validate_selection_configuration(selection: BaselineSelection, args: argparse.Namespace, name: str) -> None:
     if selection.config.get("baseline_mode") != "paired_alpha0":
         raise ValueError(
@@ -144,13 +148,11 @@ def validate_selection_configuration(selection: BaselineSelection, args: argpars
     generation = selection.config.get("generation", {})
     expected = {
         "model": args.model,
-        "model_half": not args.no_half,
+        "model_dtype": model_dtype_name(args.no_half),
         "num_inference_steps": args.num_inference_steps,
         "audio_length_in_s": args.audio_length_in_s,
         "cfg_scale": args.cfg_scale,
-        "apg_scale": args.apg_scale,
-        "negative_prompt": args.negative_prompt,
-        "chunked_decode": args.chunked_decode,
+        "shift": args.shift,
         "steering_frac_start": args.steering_frac_start,
         "steering_frac_end": args.steering_frac_end,
     }
@@ -256,7 +258,7 @@ def selection_metadata(selection: BaselineSelection) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a SteeringPredictor to suppress a concept in Stable Audio 3 generations.",
+        description="Train a SteeringPredictor to suppress a concept in ACE-Step 1.5 SFT generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -328,8 +330,8 @@ def parse_args() -> argparse.Namespace:
     generation.add_argument(
         "--model",
         type=str,
-        default="medium-base",
-        help="Stable Audio 3 checkpoint, has to be one of the `-base` ones because the post-trained ones ignore CFG",
+        default=ACE_STEP_MODEL_ID,
+        help="official ACE-Step 1.5 SFT checkpoint (other variants are intentionally rejected)",
     )
     generation.add_argument("--num-inference-steps", type=int, default=50, help="denoising steps per generation")
     generation.add_argument(
@@ -343,20 +345,10 @@ def parse_args() -> argparse.Namespace:
     )
     generation.add_argument("--cfg-scale", type=float, default=7.0, help="must exceed 1.0 to enable steering")
     generation.add_argument(
-        "--apg-scale",
+        "--shift",
         type=float,
-        default=0.0,
-        help=(
-            "0.0 is plain classifier free guidance, 1.0 is Stable Audio 3's own adaptive projected guidance."
-            " alpha_t interpolates between two guidance predictions, so the plain one is the default here"
-        ),
-    )
-    generation.add_argument("--negative-prompt", type=str, default=None)
-    generation.add_argument(
-        "--chunked-decode",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="decode in overlapping chunks; must match paired-alpha0 selections",
+        default=1.0,
+        help="ACE-Step flow-matching timestep shift; 1.0 is the official SFT default",
     )
 
     runtime = parser.add_argument_group("runtime")
@@ -364,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument(
         "--no-half",
         action="store_true",
-        help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
+        help="load the DiT and text encoder in float32 instead of CUDA BF16; the VAE always stays float32",
     )
 
     args = parser.parse_args()
@@ -405,15 +397,15 @@ def parse_args() -> argparse.Namespace:
         # the transformer only calls the steering model inside its classifier free guidance branch
         raise ValueError(
             f"`--cfg-scale` has to be greater than 1.0 for steering to be applied but is {args.cfg_scale}."
-            " With a lower value Stable Audio 3 skips classifier free guidance and never calls the steering model,"
+            " With a lower value ACE-Step skips classifier free guidance and never calls the steering model,"
             " so the predictor would receive no gradient."
         )
-    if not 0.0 <= args.apg_scale <= 1.0:
-        raise ValueError(f"`--apg-scale` has to be in [0.0, 1.0] but is {args.apg_scale}")
-    if not args.model.endswith("-base"):
+    if args.shift <= 0.0:
+        raise ValueError(f"`--shift` has to be positive but is {args.shift}")
+    if args.model != ACE_STEP_MODEL_ID:
         raise ValueError(
-            f"`--model` has to be a `-base` checkpoint but is {args.model!r}. The post-trained checkpoints are"
-            " distilled and ignore classifier free guidance, which is where steering is applied."
+            f"`--model` must be {ACE_STEP_MODEL_ID!r}, got {args.model!r}. Base is excluded because it supports"
+            " Extract/Lego/Complete, and Turbo is excluded because it has no CFG branch."
         )
 
     num_steered_steps = len(
@@ -645,7 +637,7 @@ def target_embedding_batch(target_embeds: dict[str, torch.Tensor], targets: list
 @torch.inference_mode()
 def run_validation(
     *,
-    pipe: SteeringStableAudioPipeline,
+    pipe: SteeringAceStepPipeline,
     predictor: SteeringPredictor,
     clap_loss: ClapLoss,
     dataloader: DataLoader,
@@ -673,10 +665,8 @@ def run_validation(
             num_inference_steps=args.num_inference_steps,
             audio_length_in_s=args.audio_length_in_s,
             cfg_scale=args.cfg_scale,
-            negative_prompt=args.negative_prompt,
-            apg_scale=args.apg_scale,
+            shift=args.shift,
             generator=generators,
-            chunked_decode=args.chunked_decode,
             output_type="pt",
         )
         waveform = output.audios
@@ -781,14 +771,11 @@ def main() -> None:
     # Show the effective retain prompt, whether explicit or derived, before an expensive first step.
     print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
 
-    # The latent trajectory, the guidance algebra and the autoencoder stay in float32 whatever the
-    # transformer runs in: the gradient reaches `alpha_t` through the Euler recurrence, the decoder
-    # and the CLAP tower, and in half precision that chain returns a gradient whose sign disagrees
-    # with a finite-difference check of the same loss more often than not.
-    print(f"Loading {args.model} on {device} with {'float32' if args.no_half else 'half'} precision")
-    pipe = SteeringStableAudioPipeline.from_pretrained(args.model, device=device, model_half=not args.no_half)
-    pipe.diffusion.requires_grad_(False)
-    pipe.diffusion.eval()
+    # The DiT and text encoder use the checkpoint's native BF16 on CUDA; the Euler trajectory and
+    # VAE decoder stay float32 because the training gradient passes through both.
+    print(f"Loading {args.model} on {device} with {model_dtype_name(args.no_half)} precision")
+    pipe = SteeringAceStepPipeline.from_pretrained(args.model, device=device, model_half=not args.no_half)
+    pipe.freeze_backbone()
 
     # the predictor casts its inputs and its output to the latents' dtype itself, so it keeps
     # working unchanged whichever precision the transformer above was loaded in
@@ -800,8 +787,8 @@ def main() -> None:
         "alpha_init": args.alpha_init,
     }
 
-    # Stable Audio 3 conditions on T5Gemma, so CLAP is loaded on its own. It scores the loss and
-    # also provides the `target_embed` the predictor is conditioned on, which keeps both in one space
+    # CLAP is independent from ACE-Step's Qwen3 conditioner. It scores the loss and also provides
+    # `target_embed` to the predictor, keeping both sides of the steering objective in one space.
     clap_loss = ClapLoss.from_pretrained().to(device)
     predictor_config["target_embed_dim"] = clap_loss.embed_dim
 
@@ -870,22 +857,17 @@ def main() -> None:
                 num_inference_steps=args.num_inference_steps,
                 audio_length_in_s=args.audio_length_in_s,
                 cfg_scale=args.cfg_scale,
-                negative_prompt=args.negative_prompt,
-                apg_scale=args.apg_scale,
+                shift=args.shift,
                 generator=generator,
                 output_type="latent",
             )
             latents = output.audios
-            # the pipeline's own post-processing, minus the clamp, which would zero the gradient of
-            # every saturated sample
             waveform = pipe.decode_latents(
                 latents,
-                padding_mask=output.padding_mask,
                 audio_length_in_s=args.audio_length_in_s,
-                chunked=args.chunked_decode,
             )
 
-            # Stable Audio 3 is stereo while CLAP's audio tower is mono, so the channels are summed
+            # ACE-Step is stereo while CLAP's audio tower is mono, so the channels are averaged
             # to a single mid signal before scoring
             audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
 
@@ -986,23 +968,21 @@ def main() -> None:
         metric_value = validation_metrics["loss"] if validation_metrics is not None else epoch_loss
 
         checkpoint = {
-            "checkpoint_schema_version": 2,
+            "checkpoint_schema_version": 3,
             "state_dict": predictor.state_dict(),
             "config": predictor_config,
             "steering_mode": STEERING_MODE,
             "model": args.model,
-            "model_half": not args.no_half,
+            "model_dtype": model_dtype_name(args.no_half),
             "args": history["args"],
             "data": data_metadata,
             "generation": {
                 "model": args.model,
-                "model_half": not args.no_half,
+                "model_dtype": model_dtype_name(args.no_half),
                 "num_inference_steps": args.num_inference_steps,
                 "audio_length_in_s": args.audio_length_in_s,
                 "cfg_scale": args.cfg_scale,
-                "apg_scale": args.apg_scale,
-                "negative_prompt": args.negative_prompt,
-                "chunked_decode": args.chunked_decode,
+                "shift": args.shift,
                 "steering_frac_start": args.steering_frac_start,
                 "steering_frac_end": args.steering_frac_end,
             },

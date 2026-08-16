@@ -100,7 +100,7 @@ def main() -> None:
     print(f"Loaded {len(prompts)} prompts")
 
     device, dtype = resolve_device_and_dtype()
-    # Stable Audio 3 is not supported by diffusers, `scripts/generate_audio_stable_audio_3.py` handles it
+    # This is the historical Stable Audio Open baseline; `generate_audio_ace_step.py` is the current backbone.
     model_id = "stabilityai/stable-audio-open-1.0"
     print(f"Loading {model_id} on {device} with {dtype}")
     pipe = StableAudioPipeline.from_pretrained(model_id, torch_dtype=dtype).to(device)

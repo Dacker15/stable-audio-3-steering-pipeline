@@ -4,26 +4,23 @@ import unittest
 from types import SimpleNamespace
 
 
-if importlib.util.find_spec("torch") is None or importlib.util.find_spec("stable_audio_3") is None:
-    raise unittest.SkipTest("PyTorch and stable_audio_3 are required for steering runtime tests")
+if any(importlib.util.find_spec(name) is None for name in ("torch", "diffusers", "transformers")):
+    raise unittest.SkipTest("PyTorch, diffusers, and transformers are required for steering runtime tests")
 
 import torch
 
-from pipelines import FixedAlphaSteering, SteeringDiffusionTransformer, SteeringPredictor, SteeringStableAudioPipeline
+from pipelines import ACE_STEP_MODEL_ID, FixedAlphaSteering, SteeringAceStepPipeline, SteeringPredictor
 from scripts.evaluate import resolve_generation_config
 from scripts.train import normalize_accumulated_gradients
 
 
 class TargetSpecificSteeringTests(unittest.TestCase):
-    def test_cfg_interpolation_endpoints_and_midpoint(self) -> None:
-        uncond = torch.tensor([1.0])
-        full = torch.tensor([3.0])
-        retain = torch.tensor([5.0])
+    def test_apg_interpolation_endpoints_and_midpoint(self) -> None:
+        full = torch.tensor([5.0])
+        retain = torch.tensor([9.0])
 
         outputs = [
-            SteeringDiffusionTransformer._interpolate_cfg_predictions(
-                uncond, full, retain, guidance_scale=2.0, alpha_t=torch.tensor([alpha])
-            )
+            SteeringAceStepPipeline._interpolate_guided_predictions(full, retain, torch.tensor([alpha]))
             for alpha in (0.0, 0.5, 1.0)
         ]
 
@@ -31,34 +28,50 @@ class TargetSpecificSteeringTests(unittest.TestCase):
         self.assertTrue(torch.equal(outputs[1], torch.tensor([7.0])))
         self.assertTrue(torch.equal(outputs[2], torch.tensor([9.0])))
 
-    def test_projected_guidance_differences_are_used_when_given(self) -> None:
-        r"""With adaptive projected guidance the pipeline substitutes its own difference terms."""
-        uncond = torch.tensor([1.0])
-        full = torch.tensor([3.0])
-        retain = torch.tensor([5.0])
-
-        output = SteeringDiffusionTransformer._interpolate_cfg_predictions(
-            uncond,
-            full,
-            retain,
-            guidance_scale=2.0,
-            alpha_t=torch.tensor([0.0]),
-            cfg_diff_full=torch.tensor([0.0]),
-            cfg_diff_retain=torch.tensor([0.0]),
-        )
-
-        # a zero difference collapses guidance onto the conditional prediction itself
-        self.assertTrue(torch.equal(output, full))
+    def test_non_sft_checkpoints_are_rejected_before_loading(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Extract/Lego/Complete"):
+            SteeringAceStepPipeline.from_pretrained("ACE-Step/acestep-v15-base", device="cpu")
 
     def test_retain_prompt_validation_and_batch_expansion(self) -> None:
         self.assertEqual(
-            SteeringStableAudioPipeline._prepare_retain_prompt("  drums and piano  ", 2),
+            SteeringAceStepPipeline._prepare_retain_prompt("  drums and piano  ", 2),
             ["drums and piano", "drums and piano"],
         )
         with self.assertRaisesRegex(ValueError, "non-empty string"):
-            SteeringStableAudioPipeline._prepare_retain_prompt(["drums", "  "], 2)
+            SteeringAceStepPipeline._prepare_retain_prompt(["drums", "  "], 2)
         with self.assertRaisesRegex(ValueError, "batch size"):
-            SteeringStableAudioPipeline._prepare_retain_prompt(["drums"], 2)
+            SteeringAceStepPipeline._prepare_retain_prompt(["drums"], 2)
+
+    def test_pipeline_is_pinned_to_official_sft_checkpoint(self) -> None:
+        self.assertEqual(ACE_STEP_MODEL_ID, "ACE-Step/acestep-v15-sft")
+
+    def test_published_silence_latent_layout_is_canonicalized(self) -> None:
+        published = torch.arange(64 * 25, dtype=torch.float32).reshape(1, 64, 25)
+
+        canonical = SteeringAceStepPipeline._canonicalize_silence_latent(published)
+
+        self.assertEqual(canonical.shape, (1, 25, 64))
+        self.assertTrue(torch.equal(canonical, published.transpose(1, 2)))
+
+    def test_sft_prompt_uses_the_official_instruction_sections(self) -> None:
+        formatted = SteeringAceStepPipeline._format_sft_prompt("drums and piano", 10.0)
+
+        self.assertEqual(
+            formatted,
+            "# Instruction\nFill the audio semantic mask based on the given conditions:\n\n"
+            "# Caption\ndrums and piano\n\n"
+            "# Metas\n- bpm: N/A\n- timesignature: N/A\n- keyscale: N/A\n"
+            "- duration: 10 seconds\n<|endoftext|>\n",
+        )
+
+    def test_audio_postprocessing_normalizes_each_clip_to_minus_one_dbfs(self) -> None:
+        audio = torch.tensor([[[0.25, -0.5]], [[2.0, -4.0]]])
+
+        normalized = SteeringAceStepPipeline._normalize_audio(audio)
+
+        expected_peak = 10.0 ** (-1.0 / 20.0)
+        peaks = normalized.abs().flatten(1).amax(dim=1)
+        self.assertTrue(torch.allclose(peaks, torch.full_like(peaks, expected_peak)))
 
     def test_default_alpha_bias_is_fifteen_percent_of_range(self) -> None:
         predictor = SteeringPredictor(
@@ -75,7 +88,7 @@ class TargetSpecificSteeringTests(unittest.TestCase):
 
     def test_predictor_accepts_a_singleton_height_axis(self) -> None:
         r"""
-        Stable Audio 3's latents are `(batch, channels, frames)`; the pipeline adds the height axis
+        ACE-Step latents become `(batch, 64, 1, frames)`; the pipeline adds the height axis
         the encoder needs, so the predictor has to survive a height of 1 through every downsample.
         """
         predictor = SteeringPredictor(
@@ -98,27 +111,23 @@ class TargetSpecificSteeringTests(unittest.TestCase):
             num_inference_steps=None,
             audio_length_in_s=None,
             cfg_scale=None,
-            apg_scale=None,
+            shift=None,
             steering_frac_start=None,
             steering_frac_end=None,
-            negative_prompt=None,
-            chunked_decode=None,
         )
         checkpoint_args = {"steering_frac_start": 0.2, "steering_frac_end": 0.7}
         baseline = {
             "num_inference_steps": 50,
             "audio_length_in_s": 10.0,
             "cfg_scale": 7.0,
-            "apg_scale": 0.0,
-            "negative_prompt": None,
-            "chunked_decode": False,
+            "shift": 1.0,
         }
 
         resolved = resolve_generation_config(args, checkpoint_args, baseline)
 
         self.assertEqual(resolved["num_inference_steps"], 50)
         self.assertEqual(resolved["steering_frac_start"], 0.2)
-        self.assertFalse(resolved["chunked_decode"])
+        self.assertEqual(resolved["shift"], 1.0)
 
         args.cfg_scale = 5.0
         with self.assertRaisesRegex(ValueError, "does not match saved baseline"):

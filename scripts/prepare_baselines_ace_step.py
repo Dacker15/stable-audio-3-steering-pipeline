@@ -1,5 +1,5 @@
 r"""
-Generates paired ``alpha=0`` Stable Audio 3 baselines and independently tags their instruments.
+Generates paired ``alpha=0`` ACE-Step 1.5 SFT baselines and independently tags their instruments.
 
 The target is always read from the input CSV before generation/classification. A prompt/seed pair is
 eligible for that target only when the target's baseline score reaches the configured threshold.
@@ -13,7 +13,7 @@ When absent, the configured vocabulary extracts instrument mentions from prompt 
 Legacy prompt,target datasets remain accepted and use utils.strip_target for retain_prompt.
 
 Example:
-    uv run python scripts/prepare_baselines_stable_audio_3.py \
+    uv run python scripts/prepare_baselines_ace_step.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
         --output outputs/trumpet-baseline-selection \
         --num-seeds 5 --seed 1000
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 
-from pipelines import FixedAlphaSteering, SteeringStableAudioPipeline
+from pipelines import ACE_STEP_MODEL_ID, FixedAlphaSteering, SteeringAceStepPipeline
 from utils import load_waveform, save_waveform
 from utils.instrument_classification import (
     BASELINE_CSV_FIELDS,
@@ -42,12 +42,9 @@ from utils.instrument_classification import (
 )
 
 
-BASE_MODELS = ("medium-base", "small-music-base", "small-sfx-base")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate and classify paired Stable Audio 3 baselines.",
+        description="Generate and classify paired ACE-Step 1.5 SFT baselines.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -62,15 +59,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     output = parser.add_argument_group("output")
-    output.add_argument("--output", type=Path, default=Path("outputs/baseline_selection_sa3"))
+    output.add_argument("--output", type=Path, default=Path("outputs/baseline_selection_ace_step"))
     output.add_argument(
         "--replace-output",
         action="store_true",
         help="replace a non-empty output directory instead of failing",
     )
 
-    generation = parser.add_argument_group("Stable Audio 3 generation")
-    generation.add_argument("--model", choices=BASE_MODELS, default="medium-base")
+    generation = parser.add_argument_group("ACE-Step 1.5 SFT generation")
+    generation.add_argument("--model", choices=(ACE_STEP_MODEL_ID,), default=ACE_STEP_MODEL_ID)
     generation.add_argument(
         "--steps",
         "--num-inference-steps",
@@ -80,25 +77,18 @@ def parse_args() -> argparse.Namespace:
     )
     generation.add_argument("--audio-length-in-s", type=float, default=10.0)
     generation.add_argument("--cfg-scale", type=float, default=7.0)
-    generation.add_argument("--apg-scale", type=float, default=0.0)
-    generation.add_argument("--negative-prompt", type=str, default=None)
+    generation.add_argument("--shift", type=float, default=1.0)
     generation.add_argument(
         "--baseline-mode",
         choices=("paired-alpha0", "stock"),
         default="paired-alpha0",
         help=(
             "paired-alpha0 runs the same full/unconditional/retain branch used by steering with alpha fixed to 0; "
-            "stock keeps the historical unsteered two-branch path"
+            "stock keeps the ordinary unsteered two-branch APG path"
         ),
     )
     generation.add_argument("--steering-frac-start", type=float, default=0.3)
     generation.add_argument("--steering-frac-end", type=float, default=0.8)
-    generation.add_argument(
-        "--chunked-decode",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="decode in overlapping chunks; disabled by default to match scripts/evaluate.py",
-    )
     generation.add_argument("--num-seeds", type=int, default=1, help="independent baseline seeds per prompt")
     generation.add_argument("--seed", type=int, default=1000, help="first paired seed")
 
@@ -124,12 +114,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-samples must be at least 1")
     if args.num_inference_steps < 1:
         parser.error("--steps must be at least 1")
-    if args.audio_length_in_s <= 0.0:
-        parser.error("--audio-length-in-s must be positive")
+    if not 10.0 <= args.audio_length_in_s <= 600.0:
+        parser.error("--audio-length-in-s must be in [10, 600]")
     if args.cfg_scale <= 1.0:
         parser.error("--cfg-scale must exceed 1.0 to match the steering evaluation baseline")
-    if not 0.0 <= args.apg_scale <= 1.0:
-        parser.error("--apg-scale must be in [0, 1]")
+    if args.shift <= 0.0:
+        parser.error("--shift must be positive")
     if args.num_seeds < 1:
         parser.error("--num-seeds must be at least 1")
     if not 0.0 <= args.detection_threshold <= 1.0:
@@ -205,13 +195,11 @@ def main() -> None:
         "generation": {
             "model": args.model,
             "device": str(generation_device),
-            "model_half": not args.no_half,
+            "model_dtype": "bfloat16" if not args.no_half and generation_device.type == "cuda" else "float32",
             "num_inference_steps": args.num_inference_steps,
             "audio_length_in_s": args.audio_length_in_s,
             "cfg_scale": args.cfg_scale,
-            "apg_scale": args.apg_scale,
-            "negative_prompt": args.negative_prompt,
-            "chunked_decode": args.chunked_decode,
+            "shift": args.shift,
             "steering_frac_start": args.steering_frac_start,
             "steering_frac_end": args.steering_frac_end,
         },
@@ -231,16 +219,15 @@ def main() -> None:
     write_config(output_dir / "config.json", config)
 
     print(
-        f"Loading Stable Audio 3 {args.model} on {generation_device} with "
-        f"{'float32' if args.no_half else 'half'} transformer precision"
+        f"Loading ACE-Step 1.5 SFT {args.model} on {generation_device} with "
+        f"{config['generation']['model_dtype']} DiT precision"
     )
-    pipeline = SteeringStableAudioPipeline.from_pretrained(
+    pipeline = SteeringAceStepPipeline.from_pretrained(
         args.model,
         device=generation_device,
         model_half=not args.no_half,
     )
-    pipeline.diffusion.requires_grad_(False)
-    pipeline.diffusion.eval()
+    pipeline.freeze_backbone()
     alpha_zero = FixedAlphaSteering(0.0).to(generation_device)
 
     print(f"Loading independent AudioSet classifier {args.classifier_model} on {args.classifier_device}")
@@ -296,10 +283,8 @@ def main() -> None:
                         num_inference_steps=args.num_inference_steps,
                         audio_length_in_s=args.audio_length_in_s,
                         cfg_scale=args.cfg_scale,
-                        negative_prompt=args.negative_prompt,
-                        apg_scale=args.apg_scale,
+                        shift=args.shift,
                         generator=generator,
-                        chunked_decode=args.chunked_decode,
                         output_type="pt",
                         **steering_kwargs,
                     )

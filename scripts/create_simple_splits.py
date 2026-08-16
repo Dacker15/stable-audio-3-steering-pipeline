@@ -1,9 +1,10 @@
-r"""Create reproducible group-aware splits for the simplified trumpet prompt dataset.
+r"""Create reproducible group-aware splits for simplified trumpet prompt datasets.
 
-The simplified dataset is ordered as 22 genre blocks of 10 rows. Within each block, adjacent rows
-form five prompt pairs that share genre and accompaniment but use two different templates. This
-script keeps each pair in one split and assigns, per genre block, three pairs to train, one to
-validation and one to test. The resulting row counts are 132/44/44.
+Each dataset is ordered in genre blocks of 10 rows. Within each block, adjacent rows form five
+prompt pairs that share genre and accompaniment but use two different templates. This script keeps
+each pair in one split and assigns, per genre block, three pairs to train, one to validation and one
+to test. The historical 220-row input therefore produces 132/44/44 rows; a 440-row input produces
+264/88/88.
 
 Example:
     python scripts/create_simple_splits.py \
@@ -19,7 +20,6 @@ import re
 from pathlib import Path
 
 
-EXPECTED_ROWS = 220
 BLOCK_SIZE = 10
 PAIR_SIZE = 2
 GROUPS_PER_BLOCK = BLOCK_SIZE // PAIR_SIZE
@@ -60,9 +60,10 @@ def read_dataset(path: Path) -> tuple[list[str], list[dict[str, str]]]:
                 raise ValueError(f"{path} has empty required value(s) {empty} at CSV line {line_number}")
             rows.append(normalized)
 
-    if len(rows) != EXPECTED_ROWS:
+    if len(rows) < BLOCK_SIZE or len(rows) % BLOCK_SIZE != 0:
         raise ValueError(
-            f"the simplified dataset must contain exactly {EXPECTED_ROWS} rows but {path} contains {len(rows)}"
+            f"the simplified dataset must contain a positive multiple of {BLOCK_SIZE} rows but "
+            f"{path} contains {len(rows)}"
         )
     if len({row["prompt"] for row in rows}) != len(rows):
         raise ValueError(f"{path} contains duplicate prompts; pair grouping would be ambiguous")
@@ -129,11 +130,11 @@ def _ranked_pair_indices(seed: int, group_ids: list[str]) -> list[int]:
 
 
 def assign_splits(rows: list[dict[str, str]], seed: int) -> dict[str, list[dict[str, str]]]:
-    if len(rows) != EXPECTED_ROWS:
-        raise ValueError(f"expected {EXPECTED_ROWS} rows but received {len(rows)}")
+    if len(rows) < BLOCK_SIZE or len(rows) % BLOCK_SIZE != 0:
+        raise ValueError(f"expected a positive multiple of {BLOCK_SIZE} rows but received {len(rows)}")
 
     splits: dict[str, list[dict[str, str]]] = {name: [] for name in SPLIT_GROUP_COUNTS}
-    num_blocks = EXPECTED_ROWS // BLOCK_SIZE
+    num_blocks = len(rows) // BLOCK_SIZE
 
     for block_index in range(num_blocks):
         block_start = block_index * BLOCK_SIZE
@@ -176,7 +177,10 @@ def assign_splits(rows: list[dict[str, str]], seed: int) -> dict[str, list[dict[
                 annotated["split"] = split_name
                 splits[split_name].append(annotated)
 
-    expected_counts = {"train": 132, "validation": 44, "test": 44}
+    expected_counts = {
+        name: num_blocks * group_count * PAIR_SIZE
+        for name, group_count in SPLIT_GROUP_COUNTS.items()
+    }
     actual_counts = {name: len(split_rows) for name, split_rows in splits.items()}
     if actual_counts != expected_counts:
         raise RuntimeError(f"internal split-count error: expected {expected_counts}, produced {actual_counts}")
@@ -214,7 +218,10 @@ def write_splits(
         "input": str(input_path.resolve()),
         "input_sha256": input_hash,
         "seed": seed,
-        "strategy": "22 genre blocks; validated semantic pairs kept together; 3/1/1 pairs per block",
+        "strategy": (
+            f"{sum(len(rows) for rows in splits.values()) // BLOCK_SIZE} genre blocks; validated semantic "
+            "pairs kept together; 3/1/1 pairs per block"
+        ),
         "block_size": BLOCK_SIZE,
         "pair_size": PAIR_SIZE,
         "row_counts": {name: len(rows) for name, rows in splits.items()},
@@ -244,7 +251,7 @@ def parse_args() -> argparse.Namespace:
         "--input",
         type=Path,
         default=Path("datasets/trumpet_prompts_simple_dataset.csv"),
-        help="simplified 220-row CSV with prompt, target and retain_prompt columns",
+        help="simplified CSV with prompt, target and retain_prompt columns in 10-row genre blocks",
     )
     parser.add_argument(
         "--output-dir",

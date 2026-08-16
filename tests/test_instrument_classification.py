@@ -218,16 +218,16 @@ class InstrumentClassificationTests(unittest.TestCase):
             audio_path = root / "audio" / "baseline" / "sample.wav"
             save_waveform(audio_path, np.zeros((2, 16), dtype=np.float32), 44_100)
             config = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "dataset": str(root / "dataset.csv"),
-                "generation": {"model": "medium-base"},
+                "generation": {"model": "ACE-Step/acestep-v15-sft"},
                 "classifier": {"model": "fake"},
                 "instrument_vocabulary": {"trumpet": {}},
             }
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
             base = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "sample_id": 0,
                 "seed_index": 0,
                 "seed": 1000,

@@ -18,7 +18,7 @@ class ClapLoss(nn.Module):
     Both towers are frozen: gradients only flow back through the waveform that produced
     `audio_embeds`. Use `encode_audio` to obtain those embeddings differentiably.
 
-    Stable Audio 3 conditions on T5Gemma and has no CLAP tower to borrow, so this is loaded on its
+    ACE-Step conditions on Qwen3 and has no CLAP tower to borrow, so this is loaded on its
     own with `from_pretrained`. It doubles as the source of the `target_embed` the steering predictor
     is conditioned on, which keeps the predictor's view of the target concept in the same space the
     loss scores it in.
@@ -122,7 +122,7 @@ class ClapLoss(nn.Module):
         Args:
             waveform (`torch.Tensor`): Waveform of shape `(batch_size, num_samples)`. Stereo audio
                 has to be downmixed to mono before it gets here.
-            sampling_rate (`int`): Sampling rate of `waveform`, e.g. `SteeringStableAudioPipeline.sample_rate`.
+            sampling_rate (`int`): Sampling rate of `waveform`, e.g. `SteeringAceStepPipeline.sample_rate`.
 
         Returns:
             `torch.Tensor`: Normalized audio embeddings of shape `(batch_size, embed_dim)`.
