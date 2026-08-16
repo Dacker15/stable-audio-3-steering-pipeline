@@ -31,7 +31,7 @@ import torch
 from torch import nn
 
 from losses import ClapLoss
-from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline
+from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline, FixedAlphaSteering
 from utils import PromptTargetDataset, save_waveform
 
 
@@ -67,24 +67,6 @@ SAMPLE_FIELDS = [
     "retain_dominant_ratio",
 ]
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
-
-
-class FixedAlphaSteering(nn.Module):
-    """Pipeline-compatible controller returning one constant alpha per sample."""
-
-    def __init__(self, alpha: float):
-        super().__init__()
-        self.alpha = float(alpha)
-
-    def forward(self, latents: torch.Tensor, t: torch.Tensor, target_embed: torch.Tensor) -> torch.Tensor:
-        del t, target_embed
-        return torch.full(
-            (latents.shape[0], 1, 1, 1),
-            self.alpha,
-            device=latents.device,
-            dtype=latents.dtype,
-        )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

@@ -278,8 +278,7 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
         if cross_attn_cond is None:
             raise ValueError("steering needs a cross-attention conditioned model, but `cross_attn_cond` is None")
         if has_lora(self):
-            # the base implementation enables and disables LoRA per sigma interval, which the steered
-            # batch would silently skip
+            # the base implementation enables and disables LoRA per sigma interval, which the steered batch would silently skip
             raise RuntimeError("steering does not support LoRA adapters")
 
         model_dtype = next(self.parameters()).dtype

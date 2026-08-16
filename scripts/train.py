@@ -23,8 +23,13 @@ through the Euler recurrence only. That is a first-order approximation of the tr
 what keeps the unrolled trajectory affordable.
 
 Example:
-    uv run python scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv --batch-size 2 \
+    uv run python scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv \
+        --validation-dataset datasets/trumpet_simple_splits/val.csv --batch-size 2 \
         --output outputs/trumpet-target-specific --epochs 5 --steering-frac-start 0.1 --steering-frac-end 0.8
+
+`--validation-dataset` is optional. When given, each epoch is followed by a held-out evaluation
+pass on that CSV (same `prompt,target[,retain_prompt]` schema as `--dataset`) and checkpoint
+selection tracks validation loss instead of training loss.
 """
 
 import argparse
@@ -102,9 +107,21 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="CSV with prompt,target and preferably an explicit retain_prompt column",
     )
+    data.add_argument(
+        "--validation-dataset",
+        type=Path,
+        default=None,
+        help="CSV with the same schema as --dataset, held out and evaluated once per epoch",
+    )
     data.add_argument("--output", type=Path, default=Path("outputs"), help="folder for weights and plots")
     data.add_argument("--batch-size", type=int, default=1, help="prompts generated per forward pass")
     data.add_argument("--max-samples", type=int, default=None, help="use only the first N rows of the dataset")
+    data.add_argument(
+        "--max-validation-samples",
+        type=int,
+        default=None,
+        help="use only the first N rows of --validation-dataset",
+    )
 
     steering = parser.add_argument_group("steering")
     steering.add_argument("--steering-frac-start", type=float, default=0.3, help="fraction of the loop steering starts")
@@ -177,6 +194,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(f"`--batch-size` has to be at least 1 but is {args.batch_size}")
     if args.grad_accum_steps < 1:
         raise ValueError(f"`--grad-accum-steps` has to be at least 1 but is {args.grad_accum_steps}")
+    if args.max_samples is not None and args.max_samples < 1:
+        raise ValueError(f"`--max-samples` has to be at least 1 but is {args.max_samples}")
+    if args.max_validation_samples is not None and args.max_validation_samples < 1:
+        raise ValueError(
+            f"`--max-validation-samples` has to be at least 1 but is {args.max_validation_samples}"
+        )
     if args.retain_weight < 0.0:
         # a negative weight would push the audio away from the rest of the prompt as well, i.e. ask
         # for degraded audio outright
@@ -303,6 +326,37 @@ def plot_loss_curve(history: dict, path: Path) -> None:
     draw_series(ax_cos, "target_similarity", PALETTE["series"], "target — suppressed")
     draw_series(ax_cos, "retain_similarity", PALETTE["series_2"], "retain prompt — preserved")
 
+    validation_epochs = [record for record in history["epochs"] if record.get("validation") is not None]
+    if validation_epochs:
+        validation_steps = [record["last_step"] for record in validation_epochs]
+        ax_loss.plot(
+            validation_steps,
+            [record["validation"]["loss"] for record in validation_epochs],
+            color=PALETTE["series_2"],
+            marker="o",
+            linewidth=1.5,
+            label="validation loss",
+        )
+        ax_cos.plot(
+            validation_steps,
+            [record["validation"]["target_similarity"] for record in validation_epochs],
+            color=PALETTE["series"],
+            marker="o",
+            linestyle="--",
+            linewidth=1.2,
+            label="validation target",
+        )
+        ax_cos.plot(
+            validation_steps,
+            [record["validation"]["retain_similarity"] for record in validation_epochs],
+            color=PALETTE["series_2"],
+            marker="o",
+            linestyle="--",
+            linewidth=1.2,
+            label="validation retain",
+        )
+        ax_loss.legend(frameon=False, fontsize=9, loc="best")
+
     for ax, title, ylabel in (
         (ax_loss, "Training loss — the suppression and retain terms combined", "loss"),
         (ax_cos, "CLAP cosine similarity, target against retain prompt", "cosine similarity"),
@@ -391,6 +445,76 @@ def plot_alpha_schedule(history: dict, path: Path, alpha_min: float, alpha_max: 
     save_figure(fig, path)
 
 
+@torch.inference_mode()
+def run_validation(
+    *,
+    pipe: SteeringStableAudioPipeline,
+    predictor: SteeringPredictor,
+    clap_loss: ClapLoss,
+    dataloader: DataLoader,
+    args: argparse.Namespace,
+) -> dict:
+    r"""Evaluates the held-out `--validation-dataset` once, with a fixed per-batch seed."""
+    predictor.eval()
+    total_loss = 0.0
+    total_target_similarity = 0.0
+    total_retain_similarity = 0.0
+    total_samples = 0
+    alpha_records: list[tuple[int, float]] = []
+
+    for batch_index, (prompts, targets, retains) in enumerate(dataloader):
+        # fixed per-batch seed, independent of the training step counter, so validation numbers
+        # stay comparable across epochs
+        generator = torch.Generator().manual_seed(args.seed + 1_000_000 + batch_index)
+
+        output = pipe(
+            prompt=prompts,
+            retain_prompt=retains,
+            target_embed=clap_loss.encode_text(targets),
+            steering_model=predictor,
+            steering_frac_start=args.steering_frac_start,
+            steering_frac_end=args.steering_frac_end,
+            train=False,
+            num_inference_steps=args.num_inference_steps,
+            audio_length_in_s=args.audio_length_in_s,
+            cfg_scale=args.cfg_scale,
+            apg_scale=args.apg_scale,
+            generator=generator,
+            output_type="latent",
+        )
+        latents = output.audios
+        waveform = pipe.decode_latents(
+            latents, padding_mask=output.padding_mask, audio_length_in_s=args.audio_length_in_s
+        )
+        audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
+        target_distance = clap_loss(audio_embeds, targets)
+        retain_distance = clap_loss(audio_embeds, retains)
+        loss = -target_distance + args.retain_weight * retain_distance
+
+        batch_size = len(prompts)
+        total_samples += batch_size
+        total_loss += float(loss) * batch_size
+        total_target_similarity += (1.0 - float(target_distance)) * batch_size
+        total_retain_similarity += (1.0 - float(retain_distance)) * batch_size
+        # the pipeline records a batch mean at each step; repeating it by batch size keeps the
+        # aggregate sample-weighted when the final validation batch is smaller
+        alpha_records.extend(output.alpha_records * batch_size)
+        print(
+            f"validation batch {batch_index + 1}/{len(dataloader)} "
+            f"loss {float(loss):+.4f} target_cos {1.0 - float(target_distance):+.4f} "
+            f"retain_cos {1.0 - float(retain_distance):+.4f}",
+            flush=True,
+        )
+
+    return {
+        "num_pairs": total_samples,
+        "loss": total_loss / total_samples,
+        "target_similarity": total_target_similarity / total_samples,
+        "retain_similarity": total_retain_similarity / total_samples,
+        "alpha_by_step": mean_alpha_by_step(alpha_records),
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -410,6 +534,22 @@ def main() -> None:
         collate_fn=collate_prompt_target,
     )
     print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
+
+    validation_loader = None
+    if args.validation_dataset is not None:
+        validation_dataset = PromptTargetDataset(args.validation_dataset, args.max_validation_samples)
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_prompt_target,
+        )
+        print(
+            f"Loaded {len(validation_dataset)} validation prompts from {args.validation_dataset} -> "
+            f"{len(validation_loader)} batches"
+        )
+
     # Show the effective retain prompt, whether explicit or derived, before an expensive first step.
     _, example_target, example_retain = dataset.rows[0]
     print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
@@ -449,8 +589,13 @@ def main() -> None:
         f" [{args.steering_frac_start}, {args.steering_frac_end}), {args.audio_length_in_s}s clips"
     )
 
-    history: dict = {"args": json.loads(json.dumps(vars(args), default=str)), "iterations": [], "epochs": []}
-    best_loss = float("inf")
+    history: dict = {
+        "args": json.loads(json.dumps(vars(args), default=str)),
+        "checkpoint_selection_metric": "validation_loss" if validation_loader is not None else "training_loss",
+        "iterations": [],
+        "epochs": [],
+    }
+    best_metric = float("inf")
     step = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -546,17 +691,35 @@ def main() -> None:
             )
 
         epoch_loss = sum(epoch_losses) / len(epoch_losses)
-        history["epochs"].append(
-            {
-                "epoch": epoch,
-                "last_step": step,
-                "loss": epoch_loss,
-                "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
-                "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
-                "alpha_by_step": mean_alpha_by_step(epoch_alpha_records),
-            }
-        )
+        epoch_record = {
+            "epoch": epoch,
+            "last_step": step,
+            "loss": epoch_loss,
+            "target_similarity": sum(epoch_target_similarities) / len(epoch_target_similarities),
+            "retain_similarity": sum(epoch_retain_similarities) / len(epoch_retain_similarities),
+            "alpha_by_step": mean_alpha_by_step(epoch_alpha_records),
+            "validation": None,
+        }
         print(f"epoch {epoch}/{args.epochs} mean loss {epoch_loss:+.4f}")
+
+        validation_metrics = None
+        if validation_loader is not None:
+            validation_metrics = run_validation(
+                pipe=pipe,
+                predictor=predictor,
+                clap_loss=clap_loss,
+                dataloader=validation_loader,
+                args=args,
+            )
+            epoch_record["validation"] = validation_metrics
+            print(
+                f"epoch {epoch}/{args.epochs} validation loss {validation_metrics['loss']:+.4f} "
+                f"target_cos {validation_metrics['target_similarity']:+.4f} "
+                f"retain_cos {validation_metrics['retain_similarity']:+.4f}"
+            )
+
+        history["epochs"].append(epoch_record)
+        metric_value = validation_metrics["loss"] if validation_metrics is not None else epoch_loss
 
         checkpoint = {
             "state_dict": predictor.state_dict(),
@@ -566,10 +729,13 @@ def main() -> None:
             "args": history["args"],
             "epoch": epoch,
             "loss": epoch_loss,
+            "validation_metrics": validation_metrics,
+            "checkpoint_selection_metric": history["checkpoint_selection_metric"],
+            "checkpoint_selection_value": metric_value,
         }
         torch.save(checkpoint, output_dir / "steering_predictor.pt")
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        if metric_value < best_metric:
+            best_metric = metric_value
             torch.save(checkpoint, output_dir / "steering_predictor_best.pt")
 
         # written every epoch so an interrupted run keeps its numbers, and doubles as the
@@ -578,7 +744,8 @@ def main() -> None:
         plot_loss_curve(history, output_dir / "loss_curve.png")
         plot_alpha_schedule(history, output_dir / "alpha_schedule.png", args.alpha_min, args.alpha_max)
 
-    print(f"\nDone. Best epoch mean loss {best_loss:+.4f}. Artifacts in {output_dir.resolve()}")
+    metric_label = "validation loss" if validation_loader is not None else "training loss"
+    print(f"\nDone. Best {metric_label} {best_metric:+.4f}. Artifacts in {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
