@@ -73,20 +73,15 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--checkpoint", type=Path, required=True, help="checkpoint produced by scripts/train.py")
     data.add_argument("--output", type=Path, default=Path("outputs/evaluation"))
     data.add_argument("--max-samples", type=int, default=None, help="evaluate only the first N prompts")
-    data.add_argument(
-        "--replace-output",
-        action="store_true",
-        help="replace an existing evaluation directory (the default is to fail rather than overwrite)",
-    )
 
     methods = parser.add_argument_group("methods")
     methods.add_argument(
         "--fixed-alphas",
         type=float,
         nargs="*",
-        default=[],
+        default=[1.0],
         metavar="ALPHA",
-        help="optional constant-alpha controls evaluated in addition to base and learned",
+        help="constant-alpha controls evaluated in addition to base and learned (default contains 1.0)",
     )
 
     cfg_diff = parser.add_argument_group(
@@ -131,6 +126,7 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     runtime.add_argument(
         "--no-half",
+        default=True,
         action="store_true",
         help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
     )
@@ -226,17 +222,12 @@ def resolve_device(device_arg: str) -> torch.device:
     return device
 
 
-def prepare_output_directory(path: Path, replace: bool) -> Path:
+def prepare_output_directory(path: Path) -> Path:
     path = path.resolve()
     if path.exists() and any(path.iterdir()):
-        if not replace:
-            raise FileExistsError(
-                f"Evaluation output {path} is not empty. Choose another --output or explicitly pass --replace-output."
-            )
-        # The user explicitly named this evaluation directory and opted into replacement. Refuse broad targets.
-        if path == Path.cwd().resolve() or path == path.parent or len(path.parts) < 3:
-            raise ValueError(f"Refusing to replace unsafe output directory {path}")
-        shutil.rmtree(path)
+        raise FileExistsError(
+            f"Evaluation output {path} is not empty. Choose another --output or explicitly pass --replace-output."
+        )
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -459,7 +450,7 @@ def _same_dataset_as_training(eval_path: Path, checkpoint_args: dict) -> bool:
 
 def main() -> None:
     args = parse_args()
-    output_dir = prepare_output_directory(args.output, args.replace_output)
+    output_dir = prepare_output_directory(args.output)
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     required_keys = {"state_dict", "config"}
@@ -543,7 +534,6 @@ def main() -> None:
     # CFG-diff instead of calling a steering model, so its entry is `None` and the generation loop
     # branches on `steering_mode` rather than on `steering_model` for it.
     methods: dict[str, nn.Module | None] = {
-        "base": FixedAlphaSteering(0.0).to(device),
         "learned": predictor,
         "cfg_diff": None,
     }
