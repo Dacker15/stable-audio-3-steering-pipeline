@@ -63,9 +63,13 @@ class PromptTargetDataset(Dataset):
     falls back to `strip_target` for backwards compatibility. If the column is present, every row
     must provide a non-empty retain prompt that does not still mention its target.
 
+    The CSV may also contain a `seed` column. If present, every row must provide an integer seed,
+    which callers should use to generate that row instead of a seed derived from a global base
+    seed. If absent, every row's seed is `None`.
+
     Args:
-        path (`Path`): Path to a CSV file with `prompt` and `target` columns and, optionally, a
-            `retain_prompt` column.
+        path (`Path`): Path to a CSV file with `prompt` and `target` columns and, optionally,
+            `retain_prompt` and `seed` columns.
         max_samples (`int` or `None`, *optional*): Keep only the first `max_samples` rows. Useful for
             smoke tests, since one optimizer step costs a full generation.
     """
@@ -92,7 +96,8 @@ class PromptTargetDataset(Dataset):
                 )
 
             has_explicit_retain = "retain_prompt" in fieldnames
-            rows: list[tuple[str, str, str]] = []
+            has_explicit_seed = "seed" in fieldnames
+            rows: list[tuple[str, str, str, int | None]] = []
             for row in reader:
                 line_number = reader.line_num
                 if None in row:
@@ -124,7 +129,18 @@ class PromptTargetDataset(Dataset):
                 else:
                     retain = strip_target(prompt, target)
 
-                rows.append((prompt, target, retain))
+                if has_explicit_seed:
+                    seed_value = (row.get("seed") or "").strip()
+                    try:
+                        seed = int(seed_value)
+                    except ValueError:
+                        raise ValueError(
+                            f"`dataset` {path} has a non-integer `seed` {seed_value!r} at CSV line {line_number}"
+                        ) from None
+                else:
+                    seed = None
+
+                rows.append((prompt, target, retain, seed))
 
         if not rows:
             raise ValueError(f"`dataset` has to contain at least one non-empty row but {path} contains none")
@@ -135,7 +151,7 @@ class PromptTargetDataset(Dataset):
         # An identical retain prompt means that the row supplied no lexical evidence that the target
         # was removed. Keep this a warning: an explicit retain may legitimately remove a synonym
         # that cannot be inferred from the canonical target string.
-        unchanged = [index for index, (prompt, _, retain) in enumerate(self.rows) if retain == prompt]
+        unchanged = [index for index, (prompt, _, retain, _) in enumerate(self.rows) if retain == prompt]
         if unchanged:
             warnings.warn(
                 f"{len(unchanged)} of {len(self.rows)} selected rows of {path} have a retain prompt identical to the"
@@ -147,17 +163,20 @@ class PromptTargetDataset(Dataset):
     def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, index: int) -> tuple[str, str, str]:
+    def __getitem__(self, index: int) -> tuple[str, str, str, int | None]:
         return self.rows[index]
 
 
-def collate_prompt_target(batch: list[tuple[str, str, str]]) -> tuple[list[str], list[str], list[str]]:
+def collate_prompt_target(
+    batch: list[tuple[str, str, str, int | None]],
+) -> tuple[list[str], list[str], list[str], list[int | None]]:
     r"""
-    Collates into three `list`s of `str`. The default collate would produce tuples, while the pipeline
+    Collates into four `list`s. The default collate would produce tuples, while the pipeline
     validates `prompt` and `steering_target` against `list`.
     """
     return (
-        [prompt for prompt, _, _ in batch],
-        [target for _, target, _ in batch],
-        [retain for _, _, retain in batch],
+        [prompt for prompt, _, _, _ in batch],
+        [target for _, target, _, _ in batch],
+        [retain for _, _, retain, _ in batch],
+        [seed for _, _, _, seed in batch],
     )

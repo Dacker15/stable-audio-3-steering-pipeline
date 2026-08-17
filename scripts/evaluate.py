@@ -499,7 +499,7 @@ def main() -> None:
         "num_prompts": len(dataset),
         "num_seeds": args.num_seeds,
         "first_seed": args.seed,
-        "target_counts": dict(Counter(target for _, target, _ in dataset.rows)),
+        "target_counts": dict(Counter(target for _, target, _, _ in dataset.rows)),
         "same_dataset_as_training": same_dataset,
         "device": str(device),
         "model_half": not args.no_half,
@@ -562,9 +562,13 @@ def main() -> None:
 
         # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
         # evaluating one prompt at a time keeps every saved schedule attributable to one prompt.
-        for sample_id, (prompt, target, retain_prompt) in enumerate(dataset.rows):
+        for sample_id, (prompt, target, retain_prompt, row_seed) in enumerate(dataset.rows):
             for seed_index in range(args.num_seeds):
-                sample_seed = args.seed + seed_index * len(dataset) + sample_id
+                sample_seed = (
+                    row_seed + seed_index
+                    if row_seed is not None
+                    else args.seed + seed_index * len(dataset) + sample_id
+                )
                 for method_name, steering_model in methods.items():
                     # Recreate the generator for every method so paired runs receive identical noise.
                     generator = torch.Generator().manual_seed(sample_seed)

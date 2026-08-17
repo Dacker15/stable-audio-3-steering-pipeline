@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     generation.add_argument(
         "--model",
         type=str,
-        default="medium-base",
+        default="small-music-base",
         help="Stable Audio 3 checkpoint, has to be one of the `-base` ones because the post-trained ones ignore CFG",
     )
     generation.add_argument("--num-inference-steps", type=int, default=50, help="denoising steps per generation")
@@ -184,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--seed", type=int, default=42)
     runtime.add_argument(
         "--no-half",
+        default=True,
         action="store_true",
         help="load the diffusion transformer in float32; the autoencoder and the steering algebra always are",
     )
@@ -462,10 +463,14 @@ def run_validation(
     total_samples = 0
     alpha_records: list[tuple[int, float]] = []
 
-    for batch_index, (prompts, targets, retains) in enumerate(dataloader):
-        # fixed per-batch seed, independent of the training step counter, so validation numbers
-        # stay comparable across epochs
-        generator = torch.Generator().manual_seed(args.seed + 1_000_000 + batch_index)
+    for batch_index, (prompts, targets, retains, seeds) in enumerate(dataloader):
+        if seeds[0] is not None:
+            # explicit per-row seeds: reproduce each row's own noise, not a batch-derived one
+            generator = [torch.Generator().manual_seed(seed) for seed in seeds]
+        else:
+            # fixed per-batch seed, independent of the training step counter, so validation numbers
+            # stay comparable across epochs
+            generator = torch.Generator().manual_seed(args.seed + 1_000_000 + batch_index)
 
         output = pipe(
             prompt=prompts,
@@ -551,7 +556,7 @@ def main() -> None:
         )
 
     # Show the effective retain prompt, whether explicit or derived, before an expensive first step.
-    _, example_target, example_retain = dataset.rows[0]
+    _, example_target, example_retain, _ = dataset.rows[0]
     print(f"Retain weight {args.retain_weight}, target {example_target!r}, example retain prompt: {example_retain!r}")
 
     # The latent trajectory, the guidance algebra and the autoencoder stay in float32 whatever the
@@ -607,10 +612,14 @@ def main() -> None:
         epoch_retain_similarities: list[float] = []
         epoch_alpha_records: list[tuple[int, float]] = []
 
-        for batch_index, (prompts, targets, retains) in enumerate(dataloader):
+        for batch_index, (prompts, targets, retains, seeds) in enumerate(dataloader):
             step += 1
-            # fresh noise every batch, but reproducible across runs
-            generator = torch.Generator().manual_seed(args.seed + step)
+            if seeds[0] is not None:
+                # explicit per-row seeds: reproduce each row's own noise, not a step-derived one
+                generator = [torch.Generator().manual_seed(seed) for seed in seeds]
+            else:
+                # fresh noise every batch, but reproducible across runs
+                generator = torch.Generator().manual_seed(args.seed + step)
 
             output = pipe(
                 prompt=prompts,
