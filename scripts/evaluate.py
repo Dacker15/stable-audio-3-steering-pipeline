@@ -35,24 +35,13 @@ from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipel
 from utils import PromptTargetDataset, save_waveform
 
 
-MODEL = "medium-base"
-FALLBACK_GENERATION_CONFIG = {
-    "num_inference_steps": 50,
-    "audio_length_in_s": 10.0,
-    "cfg_scale": 7.0,
-    "apg_scale": 0.0,
-    "steering_frac_start": 0.3,
-    "steering_frac_end": 0.8,
-}
-SAMPLE_FIELDS = [
+RESULT_FIELDS = [
     "sample_id",
-    "seed_index",
     "seed",
     "method",
     "prompt",
     "target",
     "retain_prompt",
-    "audio_path",
     "target_similarity",
     "prompt_similarity",
     "retain_similarity",
@@ -168,14 +157,36 @@ def parse_args() -> argparse.Namespace:
             "--alpha-shape-quantile-low and --alpha-shape-quantile-high must satisfy"
             " 0.0 <= low < high <= 1.0"
         )
+    if args.num_inference_steps is not None and args.num_inference_steps < 1:
+        parser.error("--num-inference-steps must be at least 1")
+    if args.audio_length_in_s is not None and args.audio_length_in_s <= 0.0:
+        parser.error("--audio-length-in-s must be positive")
+    if args.cfg_scale is not None and args.cfg_scale <= 1.0:
+        parser.error("--cfg-scale must exceed 1.0 because steering is applied inside the CFG branch")
+    if args.apg_scale is not None and not 0.0 <= args.apg_scale <= 1.0:
+        parser.error("--apg-scale must be in [0.0, 1.0]")
+    if (
+        args.steering_frac_start is not None
+        and args.steering_frac_end is not None
+        and not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0
+    ):
+        parser.error("--steering-frac-start and --steering-frac-end must satisfy 0.0 <= start < end <= 1.0")
     return args
 
 
 def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -> dict[str, float | int]:
     """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
 
+    fallback_config = {
+        "num_inference_steps": 50,
+        "audio_length_in_s": 10.0,
+        "cfg_scale": 7.0,
+        "apg_scale": 0.0,
+        "steering_frac_start": 0.3,
+        "steering_frac_end": 0.8,
+    }
     resolved = {}
-    for name, fallback in FALLBACK_GENERATION_CONFIG.items():
+    for name, fallback in fallback_config.items():
         cli_value = getattr(args, name)
         resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
 
@@ -436,77 +447,6 @@ def plot_alpha_schedules(alpha_runs: list[dict], path: Path) -> None:
     plt.close(fig)
 
 
-def write_report(path: Path, config: dict, summary: dict) -> None:
-    lines = [
-        "# Steering evaluation report",
-        "",
-        f"- Evaluation prompts: {config['num_prompts']}",
-        f"- Seeds per prompt: {config['num_seeds']}",
-        f"- Target counts: `{json.dumps(config['target_counts'], sort_keys=True)}`",
-        f"- Denoising steps: {config['generation']['num_inference_steps']}",
-        f"- Steering window: [{config['generation']['steering_frac_start']}, "
-        f"{config['generation']['steering_frac_end']})",
-        "",
-    ]
-    if config["same_dataset_as_training"]:
-        lines.extend(
-            [
-                "> **Data leakage warning:** the evaluation dataset path is the same path stored in the training "
-                "checkpoint. These results are diagnostic and must not be reported as held-out performance.",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            "## Summary",
-            "",
-            "| Method | Target similarity | Suppression gain | Retain similarity | Retain-similarity change |"
-            " Silence ratio | Clipping ratio |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-        ]
-    )
-    for method, values in summary["methods"].items():
-        target = values["target_similarity"]["mean"]
-        gain = values.get("target_suppression_gain", {}).get("mean")
-        retain = values["retain_similarity"]["mean"]
-        retain_change = values.get("retain_similarity_change", {}).get("mean")
-        lines.append(
-            f"| {method} | {target:.4f} | "
-            f"{'—' if gain is None else f'{gain:+.4f}'} | "
-            f"{retain:.4f} | "
-            f"{'—' if retain_change is None else f'{retain_change:+.4f}'} | "
-            f"{values['silence_ratio_mean']:.4f} | {values['clipping_ratio_mean']:.4f} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Interpretation",
-            "",
-            "- Lower target similarity is better.",
-            "- Positive suppression gain means the method is less similar to the target than the paired base audio.",
-            "- The retain prompt comes from the dataset when an explicit `retain_prompt` column is present; legacy "
-            "two-column datasets fall back to `utils.strip_target`. It is the fidelity measure optimized by "
-            "`scripts/train.py` when `--retain-weight` is non-zero, and each row's text is in `sample_metrics.csv`.",
-            "- Positive retain-similarity change means the method kept more of the rest of the prompt than the paired "
-            "base audio; a large suppression gain paired with a negative retain change usually means degraded audio "
-            "rather than a removed concept.",
-            "- Only the legacy fallback removal is lexical: modifiers of the target can survive it "
-            "(\"muted trumpet with a plunger mute\" becomes \"muted with a plunger mute\"). Explicit retain "
-            "prompts avoid this wording artifact.",
-            "- `prompt_similarity` in `sample_metrics.csv` and `summary.json` scores the full prompt, which still "
-            "contains the target, so it is only a coarse fidelity proxy and partially conflicts with suppression.",
-            "- Silence and clipping ratios are sanity checks, not complete perceptual-quality measures.",
-            "- Confidence intervals in `summary.json` are clustered by prompt: seeds are averaged first, then prompts "
-            "are bootstrapped.",
-            "",
-            "Listen to paired files with the same sample ID and seed before drawing a final conclusion.",
-        ]
-    )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def _same_dataset_as_training(eval_path: Path, checkpoint_args: dict) -> bool:
     training_path = checkpoint_args.get("dataset")
     if training_path is None:
@@ -551,7 +491,7 @@ def main() -> None:
 
     dataset = PromptTargetDataset(args.dataset, args.max_samples)
     device = resolve_device(args.device)
-    model_name = args.model or checkpoint.get("model") or MODEL
+    model_name = args.model or checkpoint.get("model") or "small-music-base"
     same_dataset = _same_dataset_as_training(args.dataset, checkpoint_args)
     if same_dataset:
         warnings.warn(
@@ -622,15 +562,12 @@ def main() -> None:
 
     rows: list[dict] = []
     alpha_runs: list[dict] = []
-    samples_path = output_dir / "sample_metrics.csv"
-    alpha_path = output_dir / "alpha_records.jsonl"
+    results_path = output_dir / "results.csv"
     total_generations = len(dataset) * args.num_seeds * len(methods)
     completed = 0
 
-    with samples_path.open("w", newline="", encoding="utf-8") as csv_file, alpha_path.open(
-        "w", encoding="utf-8"
-    ) as alpha_file:
-        writer = csv.DictWriter(csv_file, fieldnames=SAMPLE_FIELDS)
+    with results_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=RESULT_FIELDS)
         writer.writeheader()
 
         # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
@@ -677,7 +614,6 @@ def main() -> None:
                     records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
                     alpha_stats = alpha_metrics(records)
 
-                    audio_relative_path = ""
                     if args.save_audio:
                         audio_relative_path = str(
                             Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
@@ -686,13 +622,11 @@ def main() -> None:
 
                     row = {
                         "sample_id": sample_id,
-                        "seed_index": seed_index,
                         "seed": sample_seed,
                         "method": method_name,
                         "prompt": prompt,
                         "target": target,
                         "retain_prompt": retain_prompt,
-                        "audio_path": audio_relative_path,
                         "target_similarity": target_similarity,
                         "prompt_similarity": prompt_similarity,
                         "retain_similarity": retain_similarity,
@@ -703,16 +637,14 @@ def main() -> None:
                     writer.writerow(row)
                     csv_file.flush()
 
-                    alpha_run = {
-                        "sample_id": sample_id,
-                        "seed_index": seed_index,
-                        "seed": sample_seed,
-                        "method": method_name,
-                        "records": records,
-                    }
-                    alpha_runs.append(alpha_run)
-                    alpha_file.write(json.dumps(alpha_run) + "\n")
-                    alpha_file.flush()
+                    alpha_runs.append(
+                        {
+                            "sample_id": sample_id,
+                            "seed": sample_seed,
+                            "method": method_name,
+                            "records": records,
+                        }
+                    )
 
                     completed += 1
                     print(
@@ -727,7 +659,6 @@ def main() -> None:
     plot_target_similarity(summary, output_dir / "target_similarity.png")
     plot_tradeoff(summary, output_dir / "suppression_fidelity_tradeoff.png")
     plot_alpha_schedules(alpha_runs, output_dir / "alpha_schedules.png")
-    write_report(output_dir / "report.md", config, summary)
     print(f"Done. Evaluation artifacts written to {output_dir}")
 
 

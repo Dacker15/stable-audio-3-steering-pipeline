@@ -145,10 +145,8 @@ The evaluation directory contains:
 
 ```text
 config.json
-sample_metrics.csv
-alpha_records.jsonl
+results.csv
 summary.json
-report.md
 target_similarity.png
 suppression_fidelity_tradeoff.png
 alpha_schedules.png
@@ -158,6 +156,5 @@ audio/
   fixed_alpha_*/
 ```
 
-`sample_metrics.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
-contains prompt-clustered bootstrap confidence intervals, while `report.md` provides the compact
-human-readable summary.
+`results.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
+contains prompt-clustered bootstrap confidence intervals.
