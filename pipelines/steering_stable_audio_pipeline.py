@@ -14,7 +14,7 @@ predictor is trained through.
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.utils.checkpoint
@@ -26,6 +26,8 @@ from stable_audio_3.data.utils import (
 from stable_audio_3.inference.sampling import build_schedule
 from stable_audio_3.models.dit import DiffusionTransformer
 from stable_audio_3.models.lora import has_lora
+
+from pipelines.cfg_diff_alpha import compute_cfg_diff_alpha
 
 # Stamped into every checkpoint and checked by the evaluator: a predictor is only meaningful for the
 # backbone and the guidance formula it was fitted against.
@@ -74,7 +76,7 @@ class SteeringState:
     """
 
     retain_cross_attn_cond: torch.Tensor
-    steering_model: torch.nn.Module
+    steering_model: torch.nn.Module | None
     target_embed: torch.Tensor
     num_steps: int
     frac_start: float
@@ -82,6 +84,15 @@ class SteeringState:
     train: bool = False
     step: int | None = None
     records: list[tuple[int, float]] = field(default_factory=list)
+    # Regime A (`mode="cfg_diff"`): deterministic, per-frame `alpha_t` from the CFG-diff norm,
+    # computed by `compute_cfg_diff_alpha` instead of calling `steering_model`. `alpha_min` /
+    # `alpha_max` mirror `SteeringPredictor`'s own bounds for compatibility between the two modes.
+    mode: Literal["learned", "cfg_diff"] = "learned"
+    alpha_min: float = 0.0
+    alpha_max: float = 1.0
+    magnitude: float = 0.6
+    quantile_low: float = 0.10
+    quantile_high: float = 0.90
 
     def is_active(self, cfg_scale: float) -> bool:
         if self.step is None or cfg_scale == 1.0:
@@ -127,22 +138,21 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
         return transformer
 
     @staticmethod
-    def _interpolate_cfg_predictions(
+    def _cfg_predictions(
         pred_uncond,
         pred_full,
         pred_retain,
         guidance_scale,
-        alpha_t,
         cfg_diff_full=None,
         cfg_diff_retain=None,
     ):
         r"""
-        Combines the three predictions into one, in the denoised space Stable Audio 3 guides in.
+        Computes the full-prompt and retain-prompt guided predictions, in the denoised space Stable
+        Audio 3 guides in. `alpha_t` — from either steering mode — interpolates between the two.
 
-        With the default `cfg_diff_*`, i.e. plain classifier free guidance, this is
-        `uncond + guidance_scale * (cond - uncond)` for each of the full and the retain branch,
-        linearly interpolated by `alpha_t`. Adaptive projected guidance replaces each difference with
-        its projected counterpart, which is why they can be passed in.
+        With the default `cfg_diff_*`, i.e. plain classifier free guidance, each is
+        `uncond + guidance_scale * (cond - uncond)`. Adaptive projected guidance replaces the
+        difference with its projected counterpart, which is why they can be passed in.
         """
         if cfg_diff_full is None:
             cfg_diff_full = pred_full - pred_uncond
@@ -151,7 +161,7 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
 
         full_cfg = pred_full + (guidance_scale - 1.0) * cfg_diff_full
         retain_cfg = pred_retain + (guidance_scale - 1.0) * cfg_diff_retain
-        return full_cfg + alpha_t * (retain_cfg - full_cfg)
+        return full_cfg, retain_cfg
 
     def _guidance_diff(self, cond_denoised, uncond_denoised, apg_scale, padding_mask, cfg_norm_threshold):
         r"""Mirrors the norm-clipping and adaptive projected guidance of the base transformer."""
@@ -354,15 +364,11 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
         uncond_denoised = base - uncond_output * sigma
         retain_denoised = base - retain_output * sigma
 
-        alpha_t = self._predict_alpha(state, latents, t)
-        state.records.append((state.step, float(alpha_t.detach().float().mean())))
-
-        steered_denoised = self._interpolate_cfg_predictions(
+        full_cfg, retain_cfg = self._cfg_predictions(
             uncond_denoised,
             full_denoised,
             retain_denoised,
             cfg_scale,
-            alpha_t,
             cfg_diff_full=self._guidance_diff(
                 full_denoised, uncond_denoised, apg_scale, padding_mask, cfg_norm_threshold
             ),
@@ -370,6 +376,22 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
                 retain_denoised, uncond_denoised, apg_scale, padding_mask, cfg_norm_threshold
             ),
         )
+
+        if state.mode == "learned":
+            alpha_t = self._predict_alpha(state, latents, t)
+        else:
+            alpha_t = compute_cfg_diff_alpha(
+                full_cfg,
+                retain_cfg,
+                state.alpha_min,
+                state.alpha_max,
+                state.magnitude,
+                quantile_low=state.quantile_low,
+                quantile_high=state.quantile_high,
+            )
+        state.records.append((state.step, float(alpha_t.detach().float().mean())))
+
+        steered_denoised = full_cfg + alpha_t * (retain_cfg - full_cfg)
 
         output = (base - steered_denoised) / sigma
 
@@ -549,8 +571,14 @@ class SteeringStableAudioPipeline:
         retain_prompt: str | list[str] | None = None,
         target_embed: torch.Tensor | None = None,
         steering_model: torch.nn.Module | None = None,
+        steering_mode: Literal["learned", "cfg_diff"] = "learned",
         steering_frac_start: float = 0.0,
         steering_frac_end: float = 1.0,
+        alpha_min: float = 0.0,
+        alpha_max: float = 1.0,
+        alpha_magnitude: float = 0.6,
+        alpha_shape_quantile_low: float = 0.10,
+        alpha_shape_quantile_high: float = 0.90,
         num_inference_steps: int = 50,
         audio_length_in_s: float = 10.0,
         cfg_scale: float = 7.0,
@@ -575,12 +603,29 @@ class SteeringStableAudioPipeline:
                 `(batch_size, target_embed_dim)`, passed straight to `steering_model`. Stable Audio 3
                 conditions on T5Gemma and has no CLAP tower of its own, so the caller supplies this;
                 `losses.ClapLoss.encode_text` produces it in the same space the training loss scores.
-            steering_model (`torch.nn.Module`): Model called as
-                `steering_model(latents=..., t=..., target_embed=...)` to predict `alpha_t`.
+            steering_model (`torch.nn.Module`): Required when `steering_mode` is `"learned"`. Called
+                as `steering_model(latents=..., t=..., target_embed=...)` to predict `alpha_t`. Has
+                to be `None` when `steering_mode` is `"cfg_diff"`, since that mode needs no learned
+                model.
+            steering_mode (`"learned"` or `"cfg_diff"`, *optional*, defaults to `"learned"`):
+                `"learned"` calls `steering_model` for `alpha_t`, as before. `"cfg_diff"` derives a
+                deterministic, per-frame `alpha_t` from the norm of the CFG-diff between the
+                full-prompt and retain-prompt guidance (`pipelines.compute_cfg_diff_alpha`), at zero
+                training cost. Either way the steering window and CFG algebra are identical; only the
+                source of `alpha_t` differs.
             steering_frac_start (`float`, *optional*, defaults to 0.0): Fraction of the denoising loop
                 (by step index) where steering begins.
             steering_frac_end (`float`, *optional*, defaults to 1.0): Fraction of the denoising loop
                 (by step index) where steering ends.
+            alpha_min, alpha_max (`float`, *optional*, defaults to 0.0 and 1.0): Bounds of `alpha_t`
+                in `"cfg_diff"` mode, matching `SteeringPredictor`'s own defaults for compatibility.
+                Unused in `"learned"` mode, where the bounds live in `steering_model` instead.
+            alpha_magnitude (`float`, *optional*, defaults to 0.6): Global gain in `[0, 1]` for
+                `"cfg_diff"` mode, a fixed hyperparameter rather than a learned one. Unused in
+                `"learned"` mode.
+            alpha_shape_quantile_low, alpha_shape_quantile_high (`float`, *optional*, defaults to
+                0.10 and 0.90): Percentiles used by `"cfg_diff"` mode to normalize its temporal
+                profile per sample. Unused in `"learned"` mode.
             cfg_scale (`float`, *optional*, defaults to 7.0): Classifier free guidance scale. Has to
                 differ from 1.0 for steering to happen at all.
             apg_scale (`float`, *optional*, defaults to 0.0): 0.0 is plain classifier free guidance,
@@ -611,11 +656,21 @@ class SteeringStableAudioPipeline:
         batch_size = len(prompts)
         device = self.device
 
-        steering_enabled = cfg_scale != 1.0 and steering_model is not None
-        if steering_model is not None and cfg_scale == 1.0:
+        if steering_mode not in ("learned", "cfg_diff"):
+            raise ValueError(f"`steering_mode` has to be 'learned' or 'cfg_diff' but is {steering_mode!r}")
+        if steering_mode == "cfg_diff" and steering_model is not None:
+            raise ValueError(
+                "`steering_model` has to be `None` when `steering_mode` is 'cfg_diff': that mode derives"
+                " `alpha_t` deterministically from the CFG-diff and needs no learned model, so `SteeringPredictor`"
+                " should not even be instantiated for it."
+            )
+
+        steering_requested = steering_model is not None or steering_mode == "cfg_diff"
+        steering_enabled = cfg_scale != 1.0 and steering_requested
+        if steering_requested and cfg_scale == 1.0:
             raise ValueError(
                 "`cfg_scale` has to differ from 1.0 for steering to be applied, because Stable Audio 3 skips its"
-                " guidance branch entirely at 1.0 and the steering model would never be called."
+                " guidance branch entirely at 1.0 and steering would never be applied."
             )
 
         if steering_enabled:
@@ -722,6 +777,12 @@ class SteeringStableAudioPipeline:
                 frac_start=steering_frac_start,
                 frac_end=steering_frac_end,
                 train=train,
+                mode=steering_mode,
+                alpha_min=alpha_min,
+                alpha_max=alpha_max,
+                magnitude=alpha_magnitude,
+                quantile_low=alpha_shape_quantile_low,
+                quantile_high=alpha_shape_quantile_high,
             )
         self.transformer.steering = state
 

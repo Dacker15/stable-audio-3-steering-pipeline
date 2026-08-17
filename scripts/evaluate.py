@@ -100,6 +100,33 @@ def parse_args() -> argparse.Namespace:
         help="optional constant-alpha controls evaluated in addition to base and learned",
     )
 
+    cfg_diff = parser.add_argument_group(
+        "cfg-diff regime",
+        description=(
+            "Regime A: a zero-cost, training-free 'cfg_diff' method is always evaluated alongside base and"
+            " learned, deriving a deterministic per-frame alpha_t from the CFG-diff norm instead of calling the"
+            " predictor. It reuses alpha_min/alpha_max from the checkpoint's predictor config."
+        ),
+    )
+    cfg_diff.add_argument(
+        "--alpha-magnitude",
+        type=float,
+        default=0.6,
+        help="global gain in [0, 1] for the cfg_diff method's alpha_t",
+    )
+    cfg_diff.add_argument(
+        "--alpha-shape-quantile-low",
+        type=float,
+        default=0.10,
+        help="low percentile used by the cfg_diff method to normalize its temporal profile per sample",
+    )
+    cfg_diff.add_argument(
+        "--alpha-shape-quantile-high",
+        type=float,
+        default=0.90,
+        help="high percentile used by the cfg_diff method to normalize its temporal profile per sample",
+    )
+
     generation = parser.add_argument_group("generation")
     generation.add_argument("--model", default=None, help="Stable Audio 3 `-base` checkpoint, defaults to the one trained against")
     generation.add_argument("--num-seeds", type=int, default=1, help="independent noises generated per prompt")
@@ -134,6 +161,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--silence-threshold cannot be negative")
     if args.clipping_threshold <= 0.0:
         parser.error("--clipping-threshold must be positive")
+    if not 0.0 <= args.alpha_magnitude <= 1.0:
+        parser.error("--alpha-magnitude must be in [0, 1]")
+    if not 0.0 <= args.alpha_shape_quantile_low < args.alpha_shape_quantile_high <= 1.0:
+        parser.error(
+            "--alpha-shape-quantile-low and --alpha-shape-quantile-high must satisfy"
+            " 0.0 <= low < high <= 1.0"
+        )
     return args
 
 
@@ -539,6 +573,11 @@ def main() -> None:
         "device": str(device),
         "model_half": not args.no_half,
         "fixed_alphas": args.fixed_alphas,
+        "cfg_diff_alpha_min": alpha_min,
+        "cfg_diff_alpha_max": alpha_max,
+        "alpha_magnitude": args.alpha_magnitude,
+        "alpha_shape_quantile_low": args.alpha_shape_quantile_low,
+        "alpha_shape_quantile_high": args.alpha_shape_quantile_high,
         "save_audio": args.save_audio,
         "silence_threshold": args.silence_threshold,
         "clipping_threshold": args.clipping_threshold,
@@ -560,9 +599,13 @@ def main() -> None:
     predictor.requires_grad_(False)
     predictor.eval()
 
-    methods: dict[str, nn.Module] = {
+    # `cfg_diff` (Regime A) has no `nn.Module`: it derives `alpha_t` deterministically from the
+    # CFG-diff instead of calling a steering model, so its entry is `None` and the generation loop
+    # branches on `steering_mode` rather than on `steering_model` for it.
+    methods: dict[str, nn.Module | None] = {
         "base": FixedAlphaSteering(0.0).to(device),
         "learned": predictor,
+        "cfg_diff": None,
     }
     for alpha in args.fixed_alphas:
         name = fixed_alpha_name(alpha)
@@ -598,12 +641,19 @@ def main() -> None:
                 for method_name, steering_model in methods.items():
                     # Recreate the generator for every method so paired runs receive identical noise.
                     generator = torch.Generator().manual_seed(sample_seed)
+                    steering_mode = "cfg_diff" if method_name == "cfg_diff" else "learned"
                     with torch.inference_mode():
                         output = pipe(
                             prompt=prompt,
                             retain_prompt=retain_prompt,
                             target_embed=target_embeds[target],
                             steering_model=steering_model,
+                            steering_mode=steering_mode,
+                            alpha_min=alpha_min,
+                            alpha_max=alpha_max,
+                            alpha_magnitude=args.alpha_magnitude,
+                            alpha_shape_quantile_low=args.alpha_shape_quantile_low,
+                            alpha_shape_quantile_high=args.alpha_shape_quantile_high,
                             steering_frac_start=generation_config["steering_frac_start"],
                             steering_frac_end=generation_config["steering_frac_end"],
                             train=False,
