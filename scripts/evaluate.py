@@ -1,26 +1,42 @@
 r"""
 Evaluates a trained ``SteeringPredictor`` against the unsteered Stable Audio 3 baseline.
 
+The evaluator runs up to 4 independent steps against the same paired noise: an always-on ``base``
+reference (constant ``alpha=0``, i.e. plain full-prompt CFG), the ``predictor`` pipeline (needs a
+trained checkpoint), the ``fixed-alpha`` pipeline (constant-alpha controls) and the ``cfg-diff``
+pipeline (deterministic, training-free). Each of the latter three has its own prefixed CLI
+parameters, so passing e.g. ``--cfg-diff-cfg-scale`` never affects the ``predictor`` pipeline's
+generation settings and vice versa.
+
 Example smoke test (using a checkpoint produced by ``scripts/train.py``):
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/validation.csv \
-        --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
-        --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --num-inference-steps 20
+        --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
+        --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --predictor-num-inference-steps 20
 
 Example final run with fixed-alpha controls:
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
-        --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
+        --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
         --output outputs/eval-final --num-seeds 5 \
-        --fixed-alphas 0.25 0.5 0.75 1.0
+        --fixed-alpha-values 0.25 0.5 0.75 1.0
+
+Example cfg-diff-only run (no trained checkpoint required):
+
+    uv run python scripts/evaluate.py \
+        --dataset datasets/trumpet_simple_splits/test.csv \
+        --output outputs/eval-cfg-diff-only --num-seeds 3 --fixed-alpha-values
+
+Omitting --predictor-checkpoint drops the "learned" method, since it needs trained predictor
+weights; --fixed-alpha-values with no values then leaves "base" and "cfg_diff" as the evaluated
+methods.
 """
 
 import argparse
 import csv
 import json
-import shutil
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -57,72 +73,105 @@ RESULT_FIELDS = [
 ]
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
 
+# Shared by every pipeline's generation-parameter resolution: the predictor pipeline falls back to
+# these only after the checkpoint's own stored training args; the other pipelines fall back to these
+# directly, since they never depend on a checkpoint.
+GENERATION_DEFAULTS: dict[str, float | int] = {
+    "num_inference_steps": 50,
+    "audio_length_in_s": 10.0,
+    "cfg_scale": 7.0,
+    "apg_scale": 0.0,
+    "steering_frac_start": 0.3,
+    "steering_frac_end": 0.8,
+}
+
+# `alpha_min`/`alpha_max`/`alpha_magnitude`/quantiles are meaningless outside `steering_mode="cfg_diff"`
+# (see `SteeringStableAudioPipeline.__call__`'s docstring), so this is what "base" and "predictor" pass
+# through: harmless placeholders, never read by `mode="learned"`.
+INERT_ALPHA_BOUNDS = (0.0, 1.0, 0.0, 0.10, 0.90)
+
+
+def _flag(prefix: str, name: str) -> str:
+    return f"--{prefix.replace('_', '-')}-{name.replace('_', '-')}"
+
+
+def _add_generation_args(group: argparse._ArgumentGroup, prefix: str, fallback_note: str) -> None:
+    flag_prefix = prefix.replace("_", "-")
+    group.add_argument(
+        f"--{flag_prefix}-num-inference-steps", dest=f"{prefix}_num_inference_steps",
+        type=int, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['num_inference_steps']}",
+    )
+    group.add_argument(
+        f"--{flag_prefix}-audio-length-in-s", dest=f"{prefix}_audio_length_in_s",
+        type=float, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['audio_length_in_s']}",
+    )
+    group.add_argument(
+        f"--{flag_prefix}-cfg-scale", dest=f"{prefix}_cfg_scale",
+        type=float, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['cfg_scale']}",
+    )
+    group.add_argument(
+        f"--{flag_prefix}-apg-scale", dest=f"{prefix}_apg_scale",
+        type=float, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['apg_scale']}",
+    )
+    group.add_argument(
+        f"--{flag_prefix}-steering-frac-start", dest=f"{prefix}_steering_frac_start",
+        type=float, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['steering_frac_start']}",
+    )
+    group.add_argument(
+        f"--{flag_prefix}-steering-frac-end", dest=f"{prefix}_steering_frac_end",
+        type=float, default=None, help=f"{fallback_note}, else {GENERATION_DEFAULTS['steering_frac_end']}",
+    )
+
+
+def _validate_generation_overrides(parser: argparse.ArgumentParser, args: argparse.Namespace, prefix: str) -> None:
+    num_inference_steps = getattr(args, f"{prefix}_num_inference_steps")
+    if num_inference_steps is not None and num_inference_steps < 1:
+        parser.error(f"{_flag(prefix, 'num_inference_steps')} must be at least 1")
+    audio_length_in_s = getattr(args, f"{prefix}_audio_length_in_s")
+    if audio_length_in_s is not None and audio_length_in_s <= 0.0:
+        parser.error(f"{_flag(prefix, 'audio_length_in_s')} must be positive")
+    cfg_scale = getattr(args, f"{prefix}_cfg_scale")
+    if cfg_scale is not None and cfg_scale <= 1.0:
+        parser.error(f"{_flag(prefix, 'cfg_scale')} must exceed 1.0 because steering is applied inside the CFG branch")
+    apg_scale = getattr(args, f"{prefix}_apg_scale")
+    if apg_scale is not None and not 0.0 <= apg_scale <= 1.0:
+        parser.error(f"{_flag(prefix, 'apg_scale')} must be in [0.0, 1.0]")
+    frac_start = getattr(args, f"{prefix}_steering_frac_start")
+    frac_end = getattr(args, f"{prefix}_steering_frac_end")
+    if frac_start is not None and frac_end is not None and not 0.0 <= frac_start < frac_end <= 1.0:
+        parser.error(
+            f"{_flag(prefix, 'steering_frac_start')} and {_flag(prefix, 'steering_frac_end')} must satisfy"
+            " 0.0 <= start < end <= 1.0"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a SteeringPredictor with paired Stable Audio 3 generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    data = parser.add_argument_group("data and checkpoint")
+    data = parser.add_argument_group("data")
     data.add_argument(
         "--dataset",
         type=Path,
         required=True,
         help="evaluation CSV with prompt,target and preferably an explicit retain_prompt column",
     )
-    data.add_argument("--checkpoint", type=Path, required=True, help="checkpoint produced by scripts/train.py")
     data.add_argument("--output", type=Path, default=Path("outputs/evaluation"))
     data.add_argument("--max-samples", type=int, default=None, help="evaluate only the first N prompts")
-
-    methods = parser.add_argument_group("methods")
-    methods.add_argument(
-        "--fixed-alphas",
-        type=float,
-        nargs="*",
-        default=[1.0],
-        metavar="ALPHA",
-        help="constant-alpha controls evaluated in addition to base and learned (default contains 1.0)",
-    )
-
-    cfg_diff = parser.add_argument_group(
-        "cfg-diff regime",
-        description=(
-            "Regime A: a zero-cost, training-free 'cfg_diff' method is always evaluated alongside base and"
-            " learned, deriving a deterministic per-frame alpha_t from the CFG-diff norm instead of calling the"
-            " predictor. It reuses alpha_min/alpha_max from the checkpoint's predictor config."
+    data.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Stable Audio 3 `-base` checkpoint; defaults to the predictor checkpoint's own model when"
+            " --predictor-checkpoint is given, else to small-music-base"
         ),
     )
-    cfg_diff.add_argument(
-        "--alpha-magnitude",
-        type=float,
-        default=0.6,
-        help="global gain in [0, 1] for the cfg_diff method's alpha_t",
-    )
-    cfg_diff.add_argument(
-        "--alpha-shape-quantile-low",
-        type=float,
-        default=0.10,
-        help="low percentile used by the cfg_diff method to normalize its temporal profile per sample",
-    )
-    cfg_diff.add_argument(
-        "--alpha-shape-quantile-high",
-        type=float,
-        default=0.90,
-        help="high percentile used by the cfg_diff method to normalize its temporal profile per sample",
-    )
 
-    generation = parser.add_argument_group("generation")
-    generation.add_argument("--model", default=None, help="Stable Audio 3 `-base` checkpoint, defaults to the one trained against")
-    generation.add_argument("--num-seeds", type=int, default=1, help="independent noises generated per prompt")
-    generation.add_argument("--seed", type=int, default=1000, help="first evaluation seed")
-    generation.add_argument("--num-inference-steps", type=int, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--audio-length-in-s", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--cfg-scale", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--apg-scale", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--steering-frac-start", type=float, default=None, help="defaults to checkpoint setting")
-    generation.add_argument("--steering-frac-end", type=float, default=None, help="defaults to checkpoint setting")
-
-    runtime = parser.add_argument_group("runtime")
+    runtime = parser.add_argument_group("noise and runtime")
+    runtime.add_argument("--num-seeds", type=int, default=1, help="independent noises generated per prompt")
+    runtime.add_argument("--seed", type=int, default=1000, help="first evaluation seed")
     runtime.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     runtime.add_argument(
         "--no-half",
@@ -135,7 +184,69 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--silence-threshold", type=float, default=1e-4)
     runtime.add_argument("--clipping-threshold", type=float, default=0.999)
 
+    predictor = parser.add_argument_group(
+        "predictor pipeline",
+        description=(
+            "The 'learned' method: SteeringPredictor loaded from --predictor-checkpoint, predicting alpha_t from"
+            " the latents at every steered step. Skipped entirely when --predictor-checkpoint is omitted."
+        ),
+    )
+    predictor.add_argument(
+        "--predictor-checkpoint",
+        type=Path,
+        default=None,
+        help="checkpoint produced by scripts/train.py; omit to skip the predictor pipeline",
+    )
+    _add_generation_args(predictor, "predictor", "defaults to checkpoint setting")
+
+    fixed_alpha = parser.add_argument_group(
+        "fixed-alpha pipeline",
+        description="Constant-alpha controls: one evaluated method per --fixed-alpha-values entry. Skipped when empty.",
+    )
+    fixed_alpha.add_argument(
+        "--fixed-alpha-values",
+        type=float,
+        nargs="*",
+        default=[1.0],
+        metavar="ALPHA",
+        help="constant alpha values to evaluate, one method each (default contains 1.0); pass with no values to skip this pipeline",
+    )
+    # fixed_alpha.add_argument(
+    #     "--fixed-alpha-min", type=float, default=0.0, help="lower bound every --fixed-alpha-values entry must satisfy"
+    # )
+    # fixed_alpha.add_argument(
+    #     "--fixed-alpha-max", type=float, default=5.0, help="upper bound every --fixed-alpha-values entry must satisfy"
+    # )
+    _add_generation_args(fixed_alpha, "fixed_alpha", "defaults to hard-coded default")
+
+    cfg_diff = parser.add_argument_group(
+        "cfg-diff pipeline",
+        description=(
+            "Regime A: a zero-cost, training-free 'cfg_diff' method, always evaluated, deriving a deterministic"
+            " per-frame alpha_t from the CFG-diff norm instead of calling a steering model."
+        ),
+    )
+    cfg_diff.add_argument("--cfg-diff-alpha-min", type=float, default=0.0, help="lower bound of cfg_diff's alpha_t")
+    cfg_diff.add_argument("--cfg-diff-alpha-max", type=float, default=5.0, help="upper bound of cfg_diff's alpha_t")
+    cfg_diff.add_argument(
+        "--cfg-diff-alpha-magnitude", type=float, default=0.6, help="global gain in [0, 1] for cfg_diff's alpha_t"
+    )
+    cfg_diff.add_argument(
+        "--cfg-diff-alpha-quantile-low",
+        type=float,
+        default=0.10,
+        help="low percentile used by cfg_diff to normalize its temporal profile per sample",
+    )
+    cfg_diff.add_argument(
+        "--cfg-diff-alpha-quantile-high",
+        type=float,
+        default=0.90,
+        help="high percentile used by cfg_diff to normalize its temporal profile per sample",
+    )
+    _add_generation_args(cfg_diff, "cfg_diff", "defaults to hard-coded default")
+
     args = parser.parse_args()
+
     if args.max_samples is not None and args.max_samples < 1:
         parser.error("--max-samples must be at least 1")
     if args.num_seeds < 1:
@@ -146,46 +257,25 @@ def parse_args() -> argparse.Namespace:
         parser.error("--silence-threshold cannot be negative")
     if args.clipping_threshold <= 0.0:
         parser.error("--clipping-threshold must be positive")
-    if not 0.0 <= args.alpha_magnitude <= 1.0:
-        parser.error("--alpha-magnitude must be in [0, 1]")
-    if not 0.0 <= args.alpha_shape_quantile_low < args.alpha_shape_quantile_high <= 1.0:
+
+    if args.cfg_diff_alpha_min >= args.cfg_diff_alpha_max:
+        parser.error("--cfg-diff-alpha-min must be smaller than --cfg-diff-alpha-max")
+    if not 0.0 <= args.cfg_diff_alpha_magnitude <= 1.0:
+        parser.error("--cfg-diff-alpha-magnitude must be in [0, 1]")
+    if not 0.0 <= args.cfg_diff_alpha_quantile_low < args.cfg_diff_alpha_quantile_high <= 1.0:
         parser.error(
-            "--alpha-shape-quantile-low and --alpha-shape-quantile-high must satisfy"
+            "--cfg-diff-alpha-quantile-low and --cfg-diff-alpha-quantile-high must satisfy"
             " 0.0 <= low < high <= 1.0"
         )
-    if args.num_inference_steps is not None and args.num_inference_steps < 1:
-        parser.error("--num-inference-steps must be at least 1")
-    if args.audio_length_in_s is not None and args.audio_length_in_s <= 0.0:
-        parser.error("--audio-length-in-s must be positive")
-    if args.cfg_scale is not None and args.cfg_scale <= 1.0:
-        parser.error("--cfg-scale must exceed 1.0 because steering is applied inside the CFG branch")
-    if args.apg_scale is not None and not 0.0 <= args.apg_scale <= 1.0:
-        parser.error("--apg-scale must be in [0.0, 1.0]")
-    if (
-        args.steering_frac_start is not None
-        and args.steering_frac_end is not None
-        and not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0
-    ):
-        parser.error("--steering-frac-start and --steering-frac-end must satisfy 0.0 <= start < end <= 1.0")
+
+    for prefix in ("predictor", "fixed_alpha", "cfg_diff"):
+        _validate_generation_overrides(parser, args, prefix)
+
     return args
 
 
-def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -> dict[str, float | int]:
-    """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
-
-    fallback_config = {
-        "num_inference_steps": 50,
-        "audio_length_in_s": 10.0,
-        "cfg_scale": 7.0,
-        "apg_scale": 0.0,
-        "steering_frac_start": 0.3,
-        "steering_frac_end": 0.8,
-    }
-    resolved = {}
-    for name, fallback in fallback_config.items():
-        cli_value = getattr(args, name)
-        resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
-
+def _finalize_generation_config(resolved: dict[str, float | int]) -> dict[str, float | int]:
+    resolved = dict(resolved)
     resolved["num_inference_steps"] = int(resolved["num_inference_steps"])
     for name in ("audio_length_in_s", "cfg_scale", "apg_scale", "steering_frac_start", "steering_frac_end"):
         resolved[name] = float(resolved[name])
@@ -213,6 +303,26 @@ def resolve_generation_config(args: argparse.Namespace, checkpoint_args: dict) -
     return resolved
 
 
+def resolve_predictor_generation_config(args: argparse.Namespace, checkpoint_args: dict) -> dict[str, float | int]:
+    """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
+
+    resolved = {}
+    for name, fallback in GENERATION_DEFAULTS.items():
+        cli_value = getattr(args, f"predictor_{name}")
+        resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
+    return _finalize_generation_config(resolved)
+
+
+def resolve_generation_config(args: argparse.Namespace, prefix: str) -> dict[str, float | int]:
+    """CLI overrides the hard-coded defaults directly; this pipeline never depends on a checkpoint."""
+
+    resolved = {}
+    for name, fallback in GENERATION_DEFAULTS.items():
+        cli_value = getattr(args, f"{prefix}_{name}")
+        resolved[name] = cli_value if cli_value is not None else fallback
+    return _finalize_generation_config(resolved)
+
+
 def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -225,9 +335,7 @@ def resolve_device(device_arg: str) -> torch.device:
 def prepare_output_directory(path: Path) -> Path:
     path = path.resolve()
     if path.exists() and any(path.iterdir()):
-        raise FileExistsError(
-            f"Evaluation output {path} is not empty. Choose another --output or explicitly pass --replace-output."
-        )
+        raise FileExistsError(f"Evaluation output {path} is not empty. Choose another --output.")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -448,42 +556,163 @@ def _same_dataset_as_training(eval_path: Path, checkpoint_args: dict) -> bool:
         return False
 
 
+def run_pipeline(
+    pipe: SteeringStableAudioPipeline,
+    clap: ClapLoss,
+    dataset: PromptTargetDataset,
+    target_embeds: dict[str, torch.Tensor],
+    methods: dict[str, tuple[nn.Module | None, str]],
+    generation_config: dict[str, float | int],
+    alpha_bounds: tuple[float, float, float, float, float],
+    args: argparse.Namespace,
+    device: torch.device,
+    sampling_rate: int,
+    writer: "csv.DictWriter",
+    csv_file,
+    rows: list[dict],
+    alpha_runs: list[dict],
+    progress: dict[str, int],
+    output_dir: Path,
+) -> None:
+    """Runs one pipeline's methods over the full dataset/seed grid, writing paired rows.
+
+    `methods` maps a method name to `(steering_model, steering_mode)`, following
+    `SteeringStableAudioPipeline.__call__`'s contract: `steering_model=None` requires
+    `steering_mode="cfg_diff"`, anything else uses `steering_mode="learned"`. `alpha_bounds` is
+    `(alpha_min, alpha_max, alpha_magnitude, quantile_low, quantile_high)`, meaningful only for
+    `"cfg_diff"` methods and otherwise an inert pass-through.
+    """
+
+    alpha_min, alpha_max, alpha_magnitude, quantile_low, quantile_high = alpha_bounds
+
+    # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
+    # evaluating one prompt at a time keeps every saved schedule attributable to one prompt.
+    for sample_id, (prompt, target, retain_prompt, row_seed) in enumerate(dataset.rows):
+        for seed_index in range(args.num_seeds):
+            sample_seed = (
+                row_seed + seed_index
+                if row_seed is not None
+                else args.seed + seed_index * len(dataset) + sample_id
+            )
+            for method_name, (steering_model, steering_mode) in methods.items():
+                # Recreate the generator for every method so paired runs receive identical noise.
+                generator = torch.Generator().manual_seed(sample_seed)
+                with torch.inference_mode():
+                    output = pipe(
+                        prompt=prompt,
+                        retain_prompt=retain_prompt,
+                        target_embed=target_embeds[target],
+                        steering_model=steering_model,
+                        steering_mode=steering_mode,
+                        alpha_min=alpha_min,
+                        alpha_max=alpha_max,
+                        alpha_magnitude=alpha_magnitude,
+                        alpha_shape_quantile_low=quantile_low,
+                        alpha_shape_quantile_high=quantile_high,
+                        steering_frac_start=generation_config["steering_frac_start"],
+                        steering_frac_end=generation_config["steering_frac_end"],
+                        train=False,
+                        num_inference_steps=generation_config["num_inference_steps"],
+                        audio_length_in_s=generation_config["audio_length_in_s"],
+                        cfg_scale=generation_config["cfg_scale"],
+                        apg_scale=generation_config["apg_scale"],
+                        generator=generator,
+                        output_type="pt",
+                    )
+                    # `(1, channels, samples)`; CLAP's audio tower is mono, so the channels are
+                    # summed to a mid signal for scoring while the saved file stays stereo
+                    waveform_tensor = output.audios.to(device)
+                    audio_embeds = clap.encode_audio(waveform_tensor.mean(dim=1), sampling_rate)
+                    target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
+                    prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
+                    retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
+
+                waveform = waveform_tensor[0].detach().float().cpu().numpy()
+                signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
+                records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
+                alpha_stats = alpha_metrics(records)
+
+                if args.save_audio:
+                    audio_relative_path = str(
+                        Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
+                    )
+                    save_waveform(output_dir / audio_relative_path, waveform, sampling_rate)
+
+                row = {
+                    "sample_id": sample_id,
+                    "seed": sample_seed,
+                    "method": method_name,
+                    "prompt": prompt,
+                    "target": target,
+                    "retain_prompt": retain_prompt,
+                    "target_similarity": target_similarity,
+                    "prompt_similarity": prompt_similarity,
+                    "retain_similarity": retain_similarity,
+                    **signal,
+                    **alpha_stats,
+                }
+                rows.append(row)
+                writer.writerow(row)
+                csv_file.flush()
+
+                alpha_runs.append(
+                    {
+                        "sample_id": sample_id,
+                        "seed": sample_seed,
+                        "method": method_name,
+                        "records": records,
+                    }
+                )
+
+                progress["completed"] += 1
+                print(
+                    f"[{progress['completed']}/{progress['total']}] sample={sample_id} seed={sample_seed} "
+                    f"method={method_name} target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
+                    f"prompt_cos={prompt_similarity:+.4f}",
+                    flush=True,
+                )
+
+
 def main() -> None:
     args = parse_args()
     output_dir = prepare_output_directory(args.output)
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    required_keys = {"state_dict", "config"}
-    missing = required_keys - set(checkpoint)
-    if missing:
-        raise ValueError(f"checkpoint {args.checkpoint} is missing keys {sorted(missing)}")
-    if "steering_mode" not in checkpoint:
-        raise ValueError(
-            f"checkpoint {args.checkpoint} predates target-specific full-to-retain steering. Its alpha values used"
-            " the incompatible global-CFG formula, so a new checkpoint must be trained."
-        )
-    if checkpoint["steering_mode"] != STEERING_MODE:
-        raise ValueError(
-            f"checkpoint {args.checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but this evaluator"
-            f" requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be evaluated on Stable Audio 3:"
-            " the two backbones do not share a latent space."
-        )
-    checkpoint_args = checkpoint.get("args", {})
-    generation_config = resolve_generation_config(args, checkpoint_args)
-    predictor_config = checkpoint["config"]
-
-    alpha_min = float(predictor_config.get("alpha_min", 0.0))
-    alpha_max = float(predictor_config.get("alpha_max", 1.0))
-    for alpha in args.fixed_alphas:
-        if not alpha_min <= alpha <= alpha_max:
+    checkpoint = None
+    checkpoint_args: dict = {}
+    predictor_config: dict = {}
+    if args.predictor_checkpoint is not None:
+        checkpoint = torch.load(args.predictor_checkpoint, map_location="cpu", weights_only=False)
+        required_keys = {"state_dict", "config"}
+        missing = required_keys - set(checkpoint)
+        if missing:
+            raise ValueError(f"checkpoint {args.predictor_checkpoint} is missing keys {sorted(missing)}")
+        if "steering_mode" not in checkpoint:
             raise ValueError(
-                f"fixed alpha {alpha} lies outside the predictor's configured range [{alpha_min}, {alpha_max}]"
+                f"checkpoint {args.predictor_checkpoint} predates target-specific full-to-retain steering. Its"
+                " alpha values used the incompatible global-CFG formula, so a new checkpoint must be trained."
             )
+        if checkpoint["steering_mode"] != STEERING_MODE:
+            raise ValueError(
+                f"checkpoint {args.predictor_checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but"
+                f" this evaluator requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be"
+                " evaluated on Stable Audio 3: the two backbones do not share a latent space."
+            )
+        checkpoint_args = checkpoint.get("args", {})
+        predictor_config = checkpoint["config"]
+
+    base_generation_config = _finalize_generation_config(dict(GENERATION_DEFAULTS))
+    predictor_generation_config = (
+        resolve_predictor_generation_config(args, checkpoint_args) if checkpoint is not None else None
+    )
+    fixed_alpha_generation_config = (
+        resolve_generation_config(args, "fixed_alpha") if args.fixed_alpha_values else None
+    )
+    cfg_diff_generation_config = resolve_generation_config(args, "cfg_diff")
 
     dataset = PromptTargetDataset(args.dataset, args.max_samples)
     device = resolve_device(args.device)
-    model_name = args.model or checkpoint.get("model") or "small-music-base"
-    same_dataset = _same_dataset_as_training(args.dataset, checkpoint_args)
+    model_name = args.model or (checkpoint.get("model") if checkpoint is not None else None) or "small-music-base"
+    same_dataset = checkpoint is not None and _same_dataset_as_training(args.dataset, checkpoint_args)
     if same_dataset:
         warnings.warn(
             "The evaluation CSV is the same dataset path stored in the checkpoint. Results measure training-set "
@@ -493,7 +722,6 @@ def main() -> None:
 
     config = {
         "dataset": str(args.dataset.resolve()),
-        "checkpoint": str(args.checkpoint.resolve()),
         "output": str(output_dir),
         "model": model_name,
         "num_prompts": len(dataset),
@@ -503,20 +731,38 @@ def main() -> None:
         "same_dataset_as_training": same_dataset,
         "device": str(device),
         "model_half": not args.no_half,
-        "fixed_alphas": args.fixed_alphas,
-        "cfg_diff_alpha_min": alpha_min,
-        "cfg_diff_alpha_max": alpha_max,
-        "alpha_magnitude": args.alpha_magnitude,
-        "alpha_shape_quantile_low": args.alpha_shape_quantile_low,
-        "alpha_shape_quantile_high": args.alpha_shape_quantile_high,
         "save_audio": args.save_audio,
         "silence_threshold": args.silence_threshold,
         "clipping_threshold": args.clipping_threshold,
         "bootstrap_samples": args.bootstrap_samples,
-        "generation": generation_config,
-        "checkpoint_epoch": checkpoint.get("epoch"),
-        "checkpoint_training_loss": checkpoint.get("loss"),
-        "steering_mode": checkpoint["steering_mode"],
+        "base": {"generation": base_generation_config},
+        "predictor": (
+            None
+            if checkpoint is None
+            else {
+                "checkpoint": str(args.predictor_checkpoint.resolve()),
+                "checkpoint_epoch": checkpoint.get("epoch"),
+                "checkpoint_training_loss": checkpoint.get("loss"),
+                "steering_mode": checkpoint["steering_mode"],
+                "generation": predictor_generation_config,
+            }
+        ),
+        "fixed_alpha": (
+            None
+            if not args.fixed_alpha_values
+            else {
+                "values": args.fixed_alpha_values,
+                "generation": fixed_alpha_generation_config,
+            }
+        ),
+        "cfg_diff": {
+            "alpha_min": args.cfg_diff_alpha_min,
+            "alpha_max": args.cfg_diff_alpha_max,
+            "alpha_magnitude": args.cfg_diff_alpha_magnitude,
+            "alpha_quantile_low": args.cfg_diff_alpha_quantile_low,
+            "alpha_quantile_high": args.cfg_diff_alpha_quantile_high,
+            "generation": cfg_diff_generation_config,
+        },
     }
     (output_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -525,23 +771,12 @@ def main() -> None:
     pipe.diffusion.requires_grad_(False)
     pipe.diffusion.eval()
 
-    predictor = SteeringPredictor(**predictor_config).to(device)
-    predictor.load_state_dict(checkpoint["state_dict"], strict=True)
-    predictor.requires_grad_(False)
-    predictor.eval()
-
-    # `cfg_diff` (Regime A) has no `nn.Module`: it derives `alpha_t` deterministically from the
-    # CFG-diff instead of calling a steering model, so its entry is `None` and the generation loop
-    # branches on `steering_mode` rather than on `steering_model` for it.
-    methods: dict[str, nn.Module | None] = {
-        "learned": predictor,
-        "cfg_diff": None,
-    }
-    for alpha in args.fixed_alphas:
-        name = fixed_alpha_name(alpha)
-        if name in methods:
-            raise ValueError(f"duplicate evaluation method {name}; remove repeated fixed alphas")
-        methods[name] = FixedAlphaSteering(alpha).to(device)
+    predictor = None
+    if checkpoint is not None:
+        predictor = SteeringPredictor(**predictor_config).to(device)
+        predictor.load_state_dict(checkpoint["state_dict"], strict=True)
+        predictor.requires_grad_(False)
+        predictor.eval()
 
     clap = ClapLoss.from_pretrained(reduction="none").to(device)
     sampling_rate = pipe.sample_rate
@@ -550,103 +785,73 @@ def main() -> None:
     # fewer distinct targets than rows, so they are embedded once up front
     target_embeds = {target: clap.encode_text([target]) for target in {row[1] for row in dataset.rows}}
 
+    fixed_alpha_methods: dict[str, tuple[nn.Module | None, str]] = {}
+    for alpha in args.fixed_alpha_values:
+        name = fixed_alpha_name(alpha)
+        if name in fixed_alpha_methods:
+            raise ValueError(f"duplicate fixed-alpha method {name}; remove repeated --fixed-alpha-values entries")
+        fixed_alpha_methods[name] = (FixedAlphaSteering(alpha).to(device), "learned")
+
+    num_methods_per_sample_seed = (
+        1  # base
+        + (1 if predictor is not None else 0)
+        + len(fixed_alpha_methods)
+        + 1  # cfg_diff
+    )
+    total_generations = len(dataset) * args.num_seeds * num_methods_per_sample_seed
+    progress = {"completed": 0, "total": total_generations}
+
     rows: list[dict] = []
     alpha_runs: list[dict] = []
     results_path = output_dir / "results.csv"
-    total_generations = len(dataset) * args.num_seeds * len(methods)
-    completed = 0
 
     with results_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=RESULT_FIELDS)
         writer.writeheader()
 
-        # Batch size is intentionally one. The current pipeline logs alpha averaged over the batch;
-        # evaluating one prompt at a time keeps every saved schedule attributable to one prompt.
-        for sample_id, (prompt, target, retain_prompt, row_seed) in enumerate(dataset.rows):
-            for seed_index in range(args.num_seeds):
-                sample_seed = (
-                    row_seed + seed_index
-                    if row_seed is not None
-                    else args.seed + seed_index * len(dataset) + sample_id
-                )
-                for method_name, steering_model in methods.items():
-                    # Recreate the generator for every method so paired runs receive identical noise.
-                    generator = torch.Generator().manual_seed(sample_seed)
-                    steering_mode = "cfg_diff" if method_name == "cfg_diff" else "learned"
-                    with torch.inference_mode():
-                        output = pipe(
-                            prompt=prompt,
-                            retain_prompt=retain_prompt,
-                            target_embed=target_embeds[target],
-                            steering_model=steering_model,
-                            steering_mode=steering_mode,
-                            alpha_min=alpha_min,
-                            alpha_max=alpha_max,
-                            alpha_magnitude=args.alpha_magnitude,
-                            alpha_shape_quantile_low=args.alpha_shape_quantile_low,
-                            alpha_shape_quantile_high=args.alpha_shape_quantile_high,
-                            steering_frac_start=generation_config["steering_frac_start"],
-                            steering_frac_end=generation_config["steering_frac_end"],
-                            train=False,
-                            num_inference_steps=generation_config["num_inference_steps"],
-                            audio_length_in_s=generation_config["audio_length_in_s"],
-                            cfg_scale=generation_config["cfg_scale"],
-                            apg_scale=generation_config["apg_scale"],
-                            generator=generator,
-                            output_type="pt",
-                        )
-                        # `(1, channels, samples)`; CLAP's audio tower is mono, so the channels are
-                        # summed to a mid signal for scoring while the saved file stays stereo
-                        waveform_tensor = output.audios.to(device)
-                        audio_embeds = clap.encode_audio(waveform_tensor.mean(dim=1), sampling_rate)
-                        target_similarity = 1.0 - float(clap(audio_embeds, target)[0])
-                        prompt_similarity = 1.0 - float(clap(audio_embeds, prompt)[0])
-                        retain_similarity = 1.0 - float(clap(audio_embeds, retain_prompt)[0])
+        # 1. base: the unsteered reference every other method is compared against in `summarize()`.
+        run_pipeline(
+            pipe, clap, dataset, target_embeds,
+            {"base": (FixedAlphaSteering(0.0).to(device), "learned")},
+            base_generation_config,
+            INERT_ALPHA_BOUNDS,
+            args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+        )
 
-                    waveform = waveform_tensor[0].detach().float().cpu().numpy()
-                    signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
-                    records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
-                    alpha_stats = alpha_metrics(records)
+        # 2. predictor: skipped when no checkpoint was given.
+        if predictor is not None:
+            run_pipeline(
+                pipe, clap, dataset, target_embeds,
+                {"learned": (predictor, "learned")},
+                predictor_generation_config,
+                INERT_ALPHA_BOUNDS,
+                args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+            )
 
-                    if args.save_audio:
-                        audio_relative_path = str(
-                            Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
-                        )
-                        save_waveform(output_dir / audio_relative_path, waveform, sampling_rate)
+        # 3. fixed-alpha: skipped when --fixed-alpha-values is empty.
+        if fixed_alpha_methods:
+            run_pipeline(
+                pipe, clap, dataset, target_embeds,
+                fixed_alpha_methods,
+                fixed_alpha_generation_config,
+                INERT_ALPHA_BOUNDS,
+                args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+            )
 
-                    row = {
-                        "sample_id": sample_id,
-                        "seed": sample_seed,
-                        "method": method_name,
-                        "prompt": prompt,
-                        "target": target,
-                        "retain_prompt": retain_prompt,
-                        "target_similarity": target_similarity,
-                        "prompt_similarity": prompt_similarity,
-                        "retain_similarity": retain_similarity,
-                        **signal,
-                        **alpha_stats,
-                    }
-                    rows.append(row)
-                    writer.writerow(row)
-                    csv_file.flush()
-
-                    alpha_runs.append(
-                        {
-                            "sample_id": sample_id,
-                            "seed": sample_seed,
-                            "method": method_name,
-                            "records": records,
-                        }
-                    )
-
-                    completed += 1
-                    print(
-                        f"[{completed}/{total_generations}] sample={sample_id} seed={sample_seed} method={method_name} "
-                        f"target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
-                        f"prompt_cos={prompt_similarity:+.4f}",
-                        flush=True,
-                    )
+        # 4. cfg-diff: always evaluated, zero-cost and training-free.
+        run_pipeline(
+            pipe, clap, dataset, target_embeds,
+            {"cfg_diff": (None, "cfg_diff")},
+            cfg_diff_generation_config,
+            (
+                args.cfg_diff_alpha_min,
+                args.cfg_diff_alpha_max,
+                args.cfg_diff_alpha_magnitude,
+                args.cfg_diff_alpha_quantile_low,
+                args.cfg_diff_alpha_quantile_high,
+            ),
+            args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+        )
 
     summary = summarize(rows, args.bootstrap_samples, args.seed)
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

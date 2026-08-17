@@ -6,10 +6,16 @@
 
 Every prompt/seed pair is generated with identical initial noise under:
 
-- `base`: constant `alpha=0`, exactly preserving full-prompt CFG;
-- `learned`: the `SteeringPredictor` loaded from the checkpoint, interpolating from full-prompt CFG
-  towards retain-prompt CFG;
-- optional fixed-alpha controls supplied through `--fixed-alphas`.
+- `base`: constant `alpha=0`, exactly preserving full-prompt CFG. Always evaluated, and independent
+  of the three pipelines below — it's the reference point every other method is compared against;
+- `learned`: the `SteeringPredictor` loaded from `--predictor-checkpoint`, interpolating from
+  full-prompt CFG towards retain-prompt CFG. Skipped when `--predictor-checkpoint` is omitted;
+- optional fixed-alpha controls supplied through `--fixed-alpha-values`;
+- `cfg_diff`: a zero-cost, training-free method, always evaluated.
+
+Each of the three pipelines (`predictor`, `fixed-alpha`, `cfg-diff`) has its own prefixed CLI
+parameters (e.g. `--predictor-cfg-scale`, `--fixed-alpha-cfg-scale`, `--cfg-diff-cfg-scale`), so they
+can be tuned and tested independently.
 
 Evaluation runs with batch size one because the current pipeline records alpha averaged across the batch. This makes each recorded schedule belong unambiguously to one prompt.
 
@@ -58,11 +64,11 @@ for checking that the machinery works; they are not comparable to a full 50-step
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
   --output outputs/eval-smoke `
   --max-samples 4 `
   --num-seeds 1 `
-  --num-inference-steps 8
+  --predictor-num-inference-steps 8
 ```
 
 ## Final paired evaluation
@@ -73,31 +79,42 @@ over a constant intervention:
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/test.csv `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
   --output outputs/eval-final `
   --num-seeds 5 `
-  --fixed-alphas 0.25 0.5 0.75 1.0
+  --fixed-alpha-values 0.25 0.5 0.75 1.0
 ```
 
 Checkpoints whose `steering_mode` does not match the evaluator's are intentionally rejected. That
 covers the previous global-CFG formula, whose `alpha` values have a different meaning, and every
 checkpoint trained against MusicLDM, which does not share a latent space with Stable Audio 3.
 
-Generation settings default to those stored in the checkpoint and can be overridden with:
+`--model` names the Stable Audio 3 `-base` checkpoint loaded for every pipeline (it has to be a
+`-base` checkpoint); it defaults to the predictor checkpoint's own model when
+`--predictor-checkpoint` is given, else to `small-music-base`.
 
-- `--model`, which has to name a `-base` checkpoint;
-- `--num-inference-steps`;
-- `--audio-length-in-s`;
-- `--cfg-scale` and `--apg-scale`;
-- `--steering-frac-start` and `--steering-frac-end`.
+Each of the three pipelines resolves its own generation settings independently, through its own
+prefixed flags:
+
+- `--predictor-num-inference-steps`, `--predictor-audio-length-in-s`, `--predictor-cfg-scale`,
+  `--predictor-apg-scale`, `--predictor-steering-frac-start`, `--predictor-steering-frac-end` —
+  default to the checkpoint's stored training settings, then to hard-coded defaults;
+- `--fixed-alpha-num-inference-steps`, `--fixed-alpha-audio-length-in-s`, `--fixed-alpha-cfg-scale`,
+  `--fixed-alpha-apg-scale`, `--fixed-alpha-steering-frac-start`, `--fixed-alpha-steering-frac-end` —
+  default straight to hard-coded defaults, since this pipeline never needs a checkpoint;
+- `--cfg-diff-num-inference-steps`, `--cfg-diff-audio-length-in-s`, `--cfg-diff-cfg-scale`,
+  `--cfg-diff-apg-scale`, `--cfg-diff-steering-frac-start`, `--cfg-diff-steering-frac-end` — same
+  fallback as fixed-alpha.
+
+The `base` reference always uses the hard-coded defaults and has no flags of its own, since its
+output doesn't depend on the steering window.
 
 The diffusion transformer is loaded in half precision unless `--no-half` is passed; the latent
 trajectory, the guidance algebra and the autoencoder are always float32. Audio saving can be disabled
 with `--no-save-audio`, although paired listening is strongly recommended. Saved clips are stereo at
 44.1 kHz; CLAP scores a mono downmix of them, since its audio tower is mono.
 
-An existing non-empty output directory is never replaced accidentally. Pass `--replace-output`
-only when the named evaluation directory may be removed and recreated.
+An existing non-empty output directory is never replaced accidentally; choose another `--output`.
 
 ## Metrics
 
@@ -154,6 +171,7 @@ audio/
   base/
   learned/
   fixed_alpha_*/
+  cfg_diff/
 ```
 
 `results.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
