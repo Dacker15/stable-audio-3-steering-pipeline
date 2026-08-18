@@ -209,7 +209,7 @@ def parse_args() -> argparse.Namespace:
         "--fixed-alpha-values",
         type=float,
         nargs="*",
-        default=[1.0],
+        default=[],
         metavar="ALPHA",
         help="constant alpha values to evaluate, one method each (default contains 1.0); pass with no values to skip this pipeline",
     )
