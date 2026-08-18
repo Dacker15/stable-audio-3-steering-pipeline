@@ -49,6 +49,7 @@ from torch import nn
 from losses import ClapLoss
 from pipelines import STEERING_MODE, SteeringPredictor, SteeringStableAudioPipeline, FixedAlphaSteering
 from utils import PromptTargetDataset, save_waveform
+from validators import AudioSetInstrumentClassifier, DEFAULT_CLASSIFIER_MODEL, InstrumentVocabulary
 
 
 RESULT_FIELDS = [
@@ -59,6 +60,7 @@ RESULT_FIELDS = [
     "target",
     "retain_prompt",
     "target_similarity",
+    "target_instrument_score",
     "prompt_similarity",
     "retain_similarity",
     "rms",
@@ -423,6 +425,7 @@ def summarize(
         method_summary = {
             "num_generations": len(method_rows),
             "target_similarity": target,
+            "target_instrument_score": float(np.mean([row["target_instrument_score"] for row in method_rows])),
             "prompt_similarity": prompt,
             "retain_similarity": retain,
             "rms_mean": float(np.mean([row["rms"] for row in method_rows])),
@@ -561,6 +564,8 @@ def run_pipeline(
     clap: ClapLoss,
     dataset: PromptTargetDataset,
     target_embeds: dict[str, torch.Tensor],
+    classifier: AudioSetInstrumentClassifier,
+    canonical_targets: dict[str, str],
     methods: dict[str, tuple[nn.Module | None, str]],
     generation_config: dict[str, float | int],
     alpha_bounds: tuple[float, float, float, float, float],
@@ -629,6 +634,7 @@ def run_pipeline(
 
                 waveform = waveform_tensor[0].detach().float().cpu().numpy()
                 signal = waveform_metrics(waveform, args.silence_threshold, args.clipping_threshold)
+                target_instrument_score = classifier.score(waveform, sampling_rate)[canonical_targets[target]]
                 records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
                 alpha_stats = alpha_metrics(records)
 
@@ -646,6 +652,7 @@ def run_pipeline(
                     "target": target,
                     "retain_prompt": retain_prompt,
                     "target_similarity": target_similarity,
+                    "target_instrument_score": target_instrument_score,
                     "prompt_similarity": prompt_similarity,
                     "retain_similarity": retain_similarity,
                     **signal,
@@ -668,7 +675,7 @@ def run_pipeline(
                 print(
                     f"[{progress['completed']}/{progress['total']}] sample={sample_id} seed={sample_seed} "
                     f"method={method_name} target_cos={target_similarity:+.4f} retain_cos={retain_similarity:+.4f} "
-                    f"prompt_cos={prompt_similarity:+.4f}",
+                    f"prompt_cos={prompt_similarity:+.4f} target_inst={target_instrument_score:.4f}",
                     flush=True,
                 )
 
@@ -720,6 +727,30 @@ def main() -> None:
             stacklevel=2,
         )
 
+    # `target_instrument_score` needs every dataset target resolvable against the classifier's
+    # vocabulary; resolved once per distinct target, up front, so an unresolvable target fails fast
+    # before any generation work happens, mirroring `target_embeds` below.
+    vocabulary = InstrumentVocabulary.default()
+    try:
+        canonical_targets = {target: vocabulary.resolve(target) for target in {row[1] for row in dataset.rows}}
+    except ValueError as error:
+        raise ValueError(
+            f"dataset {args.dataset} contains a target unresolvable against the default instrument vocabulary;"
+            f" target_instrument_score requires every dataset target to resolve: {error}"
+        ) from error
+    proxy_targets = sorted(
+        target for target, canonical in canonical_targets.items() if vocabulary.specs[canonical].is_proxy
+    )
+    if proxy_targets:
+        warnings.warn(
+            f"targets {proxy_targets} resolve only to coarse AudioSet family labels; their"
+            " target_instrument_score is a family-level proxy, not an exact-instrument score",
+            stacklevel=2,
+        )
+
+    print(f"Loading instrument classifier {DEFAULT_CLASSIFIER_MODEL} on {device}")
+    classifier = AudioSetInstrumentClassifier(vocabulary, model_name=DEFAULT_CLASSIFIER_MODEL, device=str(device))
+
     config = {
         "dataset": str(args.dataset.resolve()),
         "output": str(output_dir),
@@ -735,6 +766,11 @@ def main() -> None:
         "silence_threshold": args.silence_threshold,
         "clipping_threshold": args.clipping_threshold,
         "bootstrap_samples": args.bootstrap_samples,
+        "instrument_classifier": {
+            "model_name": classifier.model_name,
+            "revision": classifier.revision,
+            "proxy_targets": proxy_targets,
+        },
         "base": {"generation": base_generation_config},
         "predictor": (
             None
@@ -811,7 +847,7 @@ def main() -> None:
 
         # 1. base: the unsteered reference every other method is compared against in `summarize()`.
         run_pipeline(
-            pipe, clap, dataset, target_embeds,
+            pipe, clap, dataset, target_embeds, classifier, canonical_targets,
             {"base": (FixedAlphaSteering(0.0).to(device), "learned")},
             base_generation_config,
             INERT_ALPHA_BOUNDS,
@@ -821,7 +857,7 @@ def main() -> None:
         # 2. predictor: skipped when no checkpoint was given.
         if predictor is not None:
             run_pipeline(
-                pipe, clap, dataset, target_embeds,
+                pipe, clap, dataset, target_embeds, classifier, canonical_targets,
                 {"learned": (predictor, "learned")},
                 predictor_generation_config,
                 INERT_ALPHA_BOUNDS,
@@ -831,7 +867,7 @@ def main() -> None:
         # 3. fixed-alpha: skipped when --fixed-alpha-values is empty.
         if fixed_alpha_methods:
             run_pipeline(
-                pipe, clap, dataset, target_embeds,
+                pipe, clap, dataset, target_embeds, classifier, canonical_targets,
                 fixed_alpha_methods,
                 fixed_alpha_generation_config,
                 INERT_ALPHA_BOUNDS,
@@ -840,7 +876,7 @@ def main() -> None:
 
         # 4. cfg-diff: always evaluated, zero-cost and training-free.
         run_pipeline(
-            pipe, clap, dataset, target_embeds,
+            pipe, clap, dataset, target_embeds, classifier, canonical_targets,
             {"cfg_diff": (None, "cfg_diff")},
             cfg_diff_generation_config,
             (
