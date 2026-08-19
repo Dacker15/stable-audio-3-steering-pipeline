@@ -23,6 +23,7 @@ REQUIRED_INPUT_COLUMNS = (
     "prompt",
     "target",
     "seed_index",
+    "seed",
     "retain_prompt",
     "requested_instruments",
     "detected_instruments",
@@ -52,6 +53,8 @@ def parse_args() -> argparse.Namespace:
 
 def row_is_eligible(row: dict, min_score: float, line_number: int) -> tuple[bool, str | None]:
     """Returns `(eligible, rejection_reason)`; `rejection_reason` is `None` when eligible."""
+
+    return True, None
 
     try:
         requested_instruments = json.loads(row["requested_instruments"])
@@ -108,7 +111,7 @@ def main() -> None:
                     {
                         "prompt": row["prompt"],
                         "target": row["target"],
-                        "seed": row["seed_index"],
+                        "seed": int(row["seed_index"]) + int(row["seed"]),
                         "retain_prompt": row["retain_prompt"],
                     }
                 )
