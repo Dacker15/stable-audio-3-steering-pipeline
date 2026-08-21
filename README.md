@@ -57,6 +57,32 @@ uv run python scripts/create_simple_splits.py `
   --seed 42 --overwrite
 ```
 
+### Multi-target two-instrument dataset
+
+`datasets/multi_instrument_splits` is the balanced multi-target alternative. It covers 15 target
+instruments and all 105 unordered pairs between them. Every prompt requests exactly two instruments,
+exposes them separately, and then asks for call-and-response or a joint ending so both timbres have
+a clear chance to be heard. All four variants of an instrument pair remain in the same split; every
+instrument appears as a target and as a retain instrument in train, validation, and test. The split
+sizes are 300/60/60.
+
+Prompt wording raises the probability that both instruments are rendered, but no text-to-music
+model can guarantee that for every seed. During baseline preparation, use the recorded
+`requested_instrument_validity` and `all_retain_valid` fields to retain only generations in which
+the independent AudioSet classifier detects both requested instruments.
+
+Regenerate the raw 420-row CSV and its deterministic splits with:
+
+```powershell
+uv run python scripts/create_multi_instrument_dataset.py --seed 42 --overwrite
+```
+
+Use the new dataset by pointing baseline preparation to, for example:
+
+```text
+--dataset datasets/multi_instrument_splits/train.csv
+```
+
 ## Train
 
 First generate paired `alpha=0` baselines for training and validation. Only records where the

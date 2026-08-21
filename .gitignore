@@ -17,3 +17,5 @@ datasets/
 
 # Training artifacts
 outputs/
+scripts/create_multi_instrument_dataset.py
+tests/test_create_multi_instrument_dataset.py
