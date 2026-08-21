@@ -12,13 +12,13 @@ class MagnitudePredictor(nn.Module):
     `alpha_field = alpha_min + (alpha_max - alpha_min) * magnitude * shape`, where `shape` stays
     entirely deterministic (`pipelines.compute_cfg_diff_shape`, Regime A's CFG-diff profile).
 
-    Unlike `SteeringPredictor`, which predicts a full per-frame `alpha_t` and therefore reads the
-    latents' spatial structure with a convolutional encoder, this only has to produce one number per
-    sample: the latents are pooled into whole-clip statistics up front and the network never looks
-    at their frame-by-frame structure. Conditioning mirrors `SteeringPredictor`'s: the current
-    timestep, the CLAP embedding of the steering target, and the latents' own scale (which spans
-    orders of magnitude along the trajectory, so the pooled per-channel statistics are normalized by
-    it before the head reads them, with the log-scale fed back in as an explicit feature).
+    Unlike a learned model that predicts a full per-frame `alpha_t` and therefore reads the latents'
+    spatial structure with a convolutional encoder, this only has to produce one number per sample:
+    the latents are pooled into whole-clip statistics up front and the network never looks at their
+    frame-by-frame structure. Conditioning: the current timestep, the CLAP embedding of the steering
+    target, and the latents' own scale (which spans orders of magnitude along the trajectory, so the
+    pooled per-channel statistics are normalized by it before the head reads them, with the log-scale
+    fed back in as an explicit feature).
 
     Args:
         latent_channels (`int`, *optional*, defaults to 8): Number of latent channels, i.e.
@@ -29,8 +29,8 @@ class MagnitudePredictor(nn.Module):
             width of the readout MLP.
         hidden_dim (`int`, *optional*, defaults to 128): Width of the readout MLP's hidden layer.
         magnitude_init (`float`, *optional*, defaults to 0.15): Value every sample is initialized to.
-            Must lie strictly inside `(0, 1)`. Mirrors `SteeringPredictor.alpha_init`'s rationale:
-            starts with a modest steering strength without placing the sigmoid close to saturation.
+            Must lie strictly inside `(0, 1)`. Starts with a modest steering strength without placing
+            the sigmoid close to saturation.
     """
 
     def __init__(

@@ -1,26 +1,25 @@
 r"""
-Evaluates a trained ``SteeringPredictor`` against the unsteered Stable Audio 3 baseline.
+Evaluates steering methods against the unsteered Stable Audio 3 baseline.
 
-The evaluator runs up to 5 independent steps against the same paired noise: an always-on ``base``
-reference (constant ``alpha=0``, i.e. plain full-prompt CFG), the ``predictor`` pipeline (needs a
-``SteeringPredictor`` checkpoint from ``scripts/train.py``), the ``magnituder`` pipeline (needs a
+The evaluator runs up to 4 independent steps against the same paired noise: an always-on ``base``
+reference (constant ``alpha=0``, i.e. plain full-prompt CFG), the ``magnituder`` pipeline (needs a
 ``MagnitudePredictor`` checkpoint from ``scripts/train_regime_b.py``), the ``fixed-alpha`` pipeline
 (constant-alpha controls) and the ``cfg-diff`` pipeline (deterministic, training-free). Each of the
-latter four has its own prefixed CLI parameters, so passing e.g. ``--cfg-diff-cfg-scale`` never
-affects the ``predictor`` pipeline's generation settings and vice versa.
+latter three has its own prefixed CLI parameters, so passing e.g. ``--cfg-diff-cfg-scale`` never
+affects the ``magnituder`` pipeline's generation settings and vice versa.
 
-Example smoke test (using a checkpoint produced by ``scripts/train.py``):
+Example smoke test (using a checkpoint produced by ``scripts/train_regime_b.py``):
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/validation.csv \
-        --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
-        --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --predictor-num-inference-steps 20
+        --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt \
+        --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --magnituder-num-inference-steps 20
 
 Example final run with fixed-alpha controls:
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
-        --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt \
+        --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt \
         --output outputs/eval-final --num-seeds 5 \
         --fixed-alpha-values 0.25 0.5 0.75 1.0
 
@@ -30,9 +29,8 @@ Example cfg-diff-only run (no trained checkpoint required):
         --dataset datasets/trumpet_simple_splits/test.csv \
         --output outputs/eval-cfg-diff-only --num-seeds 3 --fixed-alpha-values
 
-Omitting --predictor-checkpoint drops the "learned" method, since it needs trained predictor
-weights; --fixed-alpha-values with no values then leaves "base" and "cfg_diff" as the evaluated
-methods.
+Omitting --magnituder-checkpoint drops the "magnituder" method, since it needs trained weights;
+--fixed-alpha-values with no values then leaves "base" and "cfg_diff" as the evaluated methods.
 """
 
 import argparse
@@ -49,9 +47,7 @@ from torch import nn
 
 from losses import ClapLoss
 from pipelines import (
-    STEERING_MODE,
     STEERING_MODE_MAGNITUDE,
-    SteeringPredictor,
     MagnitudePredictor,
     SteeringStableAudioPipeline,
     FixedAlphaSteering,
@@ -83,7 +79,7 @@ RESULT_FIELDS = [
 ]
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
 
-# Shared by every pipeline's generation-parameter resolution: the predictor pipeline falls back to
+# Shared by every pipeline's generation-parameter resolution: the magnituder pipeline falls back to
 # these only after the checkpoint's own stored training args; the other pipelines fall back to these
 # directly, since they never depend on a checkpoint.
 GENERATION_DEFAULTS: dict[str, float | int] = {
@@ -96,8 +92,8 @@ GENERATION_DEFAULTS: dict[str, float | int] = {
 }
 
 # `alpha_min`/`alpha_max`/`alpha_magnitude`/quantiles are meaningless outside `steering_mode="cfg_diff"`
-# (see `SteeringStableAudioPipeline.__call__`'s docstring), so this is what "base" and "predictor" pass
-# through: harmless placeholders, never read by `mode="learned"`.
+# (see `SteeringStableAudioPipeline.__call__`'s docstring), so this is what "base" and "fixed_alpha"
+# pass through: harmless placeholders, never read by `mode="learned"`.
 INERT_ALPHA_BOUNDS = (0.0, 1.0, 0.0, 0.10, 0.90)
 
 
@@ -157,7 +153,7 @@ def _validate_generation_overrides(parser: argparse.ArgumentParser, args: argpar
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a SteeringPredictor with paired Stable Audio 3 generations.",
+        description="Evaluate steering methods with paired Stable Audio 3 generations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -174,8 +170,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "Stable Audio 3 `-base` checkpoint; defaults to the predictor checkpoint's own model when"
-            " --predictor-checkpoint is given, else to small-music-base"
+            "Stable Audio 3 `-base` checkpoint; defaults to the magnituder checkpoint's own model when"
+            " --magnituder-checkpoint is given, else to small-music-base"
         ),
     )
 
@@ -193,21 +189,6 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--bootstrap-samples", type=int, default=10_000)
     runtime.add_argument("--silence-threshold", type=float, default=1e-4)
     runtime.add_argument("--clipping-threshold", type=float, default=0.999)
-
-    predictor = parser.add_argument_group(
-        "predictor pipeline",
-        description=(
-            "The 'learned' method: SteeringPredictor loaded from --predictor-checkpoint, predicting alpha_t from"
-            " the latents at every steered step. Skipped entirely when --predictor-checkpoint is omitted."
-        ),
-    )
-    predictor.add_argument(
-        "--predictor-checkpoint",
-        type=Path,
-        default=None,
-        help="checkpoint produced by scripts/train.py; omit to skip the predictor pipeline",
-    )
-    _add_generation_args(predictor, "predictor", "defaults to checkpoint setting")
 
     fixed_alpha = parser.add_argument_group(
         "fixed-alpha pipeline",
@@ -320,7 +301,7 @@ def parse_args() -> argparse.Namespace:
             " 0.0 <= low < high <= 1.0"
         )
 
-    for prefix in ("predictor", "fixed_alpha", "cfg_diff", "magnituder"):
+    for prefix in ("fixed_alpha", "cfg_diff", "magnituder"):
         _validate_generation_overrides(parser, args, prefix)
 
     return args
@@ -356,7 +337,7 @@ def _finalize_generation_config(resolved: dict[str, float | int]) -> dict[str, f
 
 
 def resolve_predictor_generation_config(
-    args: argparse.Namespace, checkpoint_args: dict, prefix: str = "predictor"
+    args: argparse.Namespace, checkpoint_args: dict, prefix: str
 ) -> dict[str, float | int]:
     """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
 
@@ -736,29 +717,6 @@ def main() -> None:
     args = parse_args()
     output_dir = prepare_output_directory(args.output)
 
-    checkpoint = None
-    checkpoint_args: dict = {}
-    predictor_config: dict = {}
-    if args.predictor_checkpoint is not None:
-        checkpoint = torch.load(args.predictor_checkpoint, map_location="cpu", weights_only=False)
-        required_keys = {"state_dict", "config"}
-        missing = required_keys - set(checkpoint)
-        if missing:
-            raise ValueError(f"checkpoint {args.predictor_checkpoint} is missing keys {sorted(missing)}")
-        if "steering_mode" not in checkpoint:
-            raise ValueError(
-                f"checkpoint {args.predictor_checkpoint} predates target-specific full-to-retain steering. Its"
-                " alpha values used the incompatible global-CFG formula, so a new checkpoint must be trained."
-            )
-        if checkpoint["steering_mode"] != STEERING_MODE:
-            raise ValueError(
-                f"checkpoint {args.predictor_checkpoint} uses steering mode {checkpoint['steering_mode']!r}, but"
-                f" this evaluator requires {STEERING_MODE!r}. Checkpoints trained against MusicLDM cannot be"
-                " evaluated on Stable Audio 3: the two backbones do not share a latent space."
-            )
-        checkpoint_args = checkpoint.get("args", {})
-        predictor_config = checkpoint["config"]
-
     magnituder_checkpoint = None
     magnituder_checkpoint_args: dict = {}
     magnituder_config: dict = {}
@@ -780,9 +738,6 @@ def main() -> None:
         magnituder_config = magnituder_checkpoint["config"]
 
     base_generation_config = _finalize_generation_config(dict(GENERATION_DEFAULTS))
-    predictor_generation_config = (
-        resolve_predictor_generation_config(args, checkpoint_args, "predictor") if checkpoint is not None else None
-    )
     magnituder_generation_config = (
         resolve_predictor_generation_config(args, magnituder_checkpoint_args, "magnituder")
         if magnituder_checkpoint is not None
@@ -797,20 +752,12 @@ def main() -> None:
     device = resolve_device(args.device)
     model_name = (
         args.model
-        or (checkpoint.get("model") if checkpoint is not None else None)
         or (magnituder_checkpoint.get("model") if magnituder_checkpoint is not None else None)
         or "small-music-base"
     )
-    same_dataset_predictor = checkpoint is not None and _same_dataset_as_training(args.dataset, checkpoint_args)
     same_dataset_magnituder = magnituder_checkpoint is not None and _same_dataset_as_training(
         args.dataset, magnituder_checkpoint_args
     )
-    if same_dataset_predictor:
-        warnings.warn(
-            "The evaluation CSV is the same dataset path stored in the predictor checkpoint. Results measure"
-            " training-set behaviour, not held-out generalization.",
-            stacklevel=2,
-        )
     if same_dataset_magnituder:
         warnings.warn(
             "The evaluation CSV is the same dataset path stored in the magnituder checkpoint. Results measure"
@@ -850,7 +797,7 @@ def main() -> None:
         "num_seeds": args.num_seeds,
         "first_seed": args.seed,
         "target_counts": dict(Counter(target for _, target, _, _ in dataset.rows)),
-        "same_dataset_as_training": {"predictor": same_dataset_predictor, "magnituder": same_dataset_magnituder},
+        "same_dataset_as_training": {"magnituder": same_dataset_magnituder},
         "device": str(device),
         "model_half": not args.no_half,
         "save_audio": args.save_audio,
@@ -863,17 +810,6 @@ def main() -> None:
             "proxy_targets": proxy_targets,
         },
         "base": {"generation": base_generation_config},
-        "predictor": (
-            None
-            if checkpoint is None
-            else {
-                "checkpoint": str(args.predictor_checkpoint.resolve()),
-                "checkpoint_epoch": checkpoint.get("epoch"),
-                "checkpoint_training_loss": checkpoint.get("loss"),
-                "steering_mode": checkpoint["steering_mode"],
-                "generation": predictor_generation_config,
-            }
-        ),
         "magnituder": (
             None
             if magnituder_checkpoint is None
@@ -913,13 +849,6 @@ def main() -> None:
     pipe.diffusion.requires_grad_(False)
     pipe.diffusion.eval()
 
-    predictor = None
-    if checkpoint is not None:
-        predictor = SteeringPredictor(**predictor_config).to(device)
-        predictor.load_state_dict(checkpoint["state_dict"], strict=True)
-        predictor.requires_grad_(False)
-        predictor.eval()
-
     magnituder_predictor = None
     if magnituder_checkpoint is not None:
         magnituder_predictor = MagnitudePredictor(**magnituder_config).to(device)
@@ -943,7 +872,6 @@ def main() -> None:
 
     num_methods_per_sample_seed = (
         1  # base
-        + (1 if predictor is not None else 0)
         + (1 if magnituder_predictor is not None else 0)
         + len(fixed_alpha_methods)
         + 1  # cfg_diff
@@ -968,17 +896,7 @@ def main() -> None:
             args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
         )
 
-        # 2. predictor: skipped when no checkpoint was given.
-        if predictor is not None:
-            run_pipeline(
-                pipe, clap, dataset, target_embeds, classifier, canonical_targets,
-                {"learned": (predictor, "learned")},
-                predictor_generation_config,
-                INERT_ALPHA_BOUNDS,
-                args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
-            )
-
-        # 2b. magnituder: skipped when no --magnituder-checkpoint was given.
+        # 2. magnituder: skipped when no --magnituder-checkpoint was given.
         if magnituder_predictor is not None:
             run_pipeline(
                 pipe, clap, dataset, target_embeds, classifier, canonical_targets,

@@ -7,27 +7,32 @@
 Every prompt/seed pair is generated with identical initial noise under:
 
 - `base`: constant `alpha=0`, exactly preserving full-prompt CFG. Always evaluated, and independent
-  of the three pipelines below — it's the reference point every other method is compared against;
-- `learned`: the `SteeringPredictor` loaded from `--predictor-checkpoint`, interpolating from
-  full-prompt CFG towards retain-prompt CFG. Skipped when `--predictor-checkpoint` is omitted;
+  of the pipelines below — it's the reference point every other method is compared against;
+- `magnituder`: the `MagnitudePredictor` loaded from `--magnituder-checkpoint`, a learned per-sample
+  gain on Regime A's deterministic CFG-diff shape. Skipped when `--magnituder-checkpoint` is omitted;
 - optional fixed-alpha controls supplied through `--fixed-alpha-values`;
 - `cfg_diff`: a zero-cost, training-free method, always evaluated.
 
-Each of the three pipelines (`predictor`, `fixed-alpha`, `cfg-diff`) has its own prefixed CLI
-parameters (e.g. `--predictor-cfg-scale`, `--fixed-alpha-cfg-scale`, `--cfg-diff-cfg-scale`), so they
+Each of the three pipelines (`magnituder`, `fixed-alpha`, `cfg-diff`) has its own prefixed CLI
+parameters (e.g. `--magnituder-cfg-scale`, `--fixed-alpha-cfg-scale`, `--cfg-diff-cfg-scale`), so they
 can be tuned and tested independently.
 
 Evaluation runs with batch size one because the current pipeline records alpha averaged across the batch. This makes each recorded schedule belong unambiguously to one prompt.
 
 ## Before running
 
-First produce a checkpoint with the existing training entry point, for example:
+To evaluate the `magnituder` method, first produce a checkpoint with `scripts/train_regime_b.py`,
+for example:
 
 ```powershell
-uv run python scripts/train.py `
+uv run python scripts/train_regime_b.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
-  --output outputs/trumpet-target-specific
+  --output outputs/trumpet-regime-b `
+  --epochs 5 --margin-target 0.30 --margin-retain 0.40 `
+  --lambda-reg 0.01 --lambda-reg-warmup-steps 200 --lambda-fid 0.1
 ```
+
+`base`, fixed-alpha and `cfg_diff` need no checkpoint at all.
 
 Create the group-aware splits first with:
 
@@ -41,10 +46,10 @@ uv run python scripts/create_simple_splits.py `
 The split contains 132/44/44 train/validation/test rows. The two templates that share a genre and
 accompaniment are assigned together, preventing their near-duplicate pair from leaking across splits.
 
-For reportable results, evaluate a held-out CSV that was not passed to `train.py`. The evaluator
-checks the evaluation path against the dataset path stored in the checkpoint and writes a leakage
-warning when they match. Evaluating the training CSV remains useful as a diagnostic or smoke test,
-but does not measure generalization.
+For reportable results, evaluate a held-out CSV that was not passed to `train_regime_b.py`. The
+evaluator checks the evaluation path against the dataset path stored in the checkpoint and writes a
+leakage warning when they match. Evaluating the training CSV remains useful as a diagnostic or smoke
+test, but does not measure generalization.
 
 The preferred CSV contract contains an explicit retain prompt:
 
@@ -64,11 +69,11 @@ for checking that the machinery works; they are not comparable to a full 50-step
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
-  --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
   --output outputs/eval-smoke `
   --max-samples 4 `
   --num-seeds 1 `
-  --predictor-num-inference-steps 8
+  --magnituder-num-inference-steps 8
 ```
 
 ## Final paired evaluation
@@ -79,25 +84,25 @@ over a constant intervention:
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/test.csv `
-  --predictor-checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
+  --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
   --output outputs/eval-final `
   --num-seeds 5 `
   --fixed-alpha-values 0.25 0.5 0.75 1.0
 ```
 
 Checkpoints whose `steering_mode` does not match the evaluator's are intentionally rejected. That
-covers the previous global-CFG formula, whose `alpha` values have a different meaning, and every
-checkpoint trained against MusicLDM, which does not share a latent space with Stable Audio 3.
+covers every checkpoint trained against MusicLDM, which does not share a latent space with Stable
+Audio 3.
 
 `--model` names the Stable Audio 3 `-base` checkpoint loaded for every pipeline (it has to be a
-`-base` checkpoint); it defaults to the predictor checkpoint's own model when
-`--predictor-checkpoint` is given, else to `small-music-base`.
+`-base` checkpoint); it defaults to the magnituder checkpoint's own model when
+`--magnituder-checkpoint` is given, else to `small-music-base`.
 
 Each of the three pipelines resolves its own generation settings independently, through its own
 prefixed flags:
 
-- `--predictor-num-inference-steps`, `--predictor-audio-length-in-s`, `--predictor-cfg-scale`,
-  `--predictor-apg-scale`, `--predictor-steering-frac-start`, `--predictor-steering-frac-end` —
+- `--magnituder-num-inference-steps`, `--magnituder-audio-length-in-s`, `--magnituder-cfg-scale`,
+  `--magnituder-apg-scale`, `--magnituder-steering-frac-start`, `--magnituder-steering-frac-end` —
   default to the checkpoint's stored training settings, then to hard-coded defaults;
 - `--fixed-alpha-num-inference-steps`, `--fixed-alpha-audio-length-in-s`, `--fixed-alpha-cfg-scale`,
   `--fixed-alpha-apg-scale`, `--fixed-alpha-steering-frac-start`, `--fixed-alpha-steering-frac-end` —
@@ -123,7 +128,7 @@ For each generated waveform the evaluator records:
 - `target_similarity`: CLAP cosine similarity between audio and target; lower is better;
 - `retain_similarity`: CLAP cosine similarity between audio and the explicit retain prompt, or the
   fallback produced by `utils.strip_target` for legacy datasets; higher is better, and this is the
-  term `scripts/train.py` optimizes alongside suppression;
+  term `scripts/train_regime_b.py` optimizes alongside suppression;
 - `prompt_similarity`: CLAP cosine similarity between audio and the full prompt;
 - RMS, peak, near-silence ratio and clipping ratio;
 - alpha mean, standard deviation, minimum and maximum;
@@ -169,7 +174,7 @@ suppression_fidelity_tradeoff.png
 alpha_schedules.png
 audio/
   base/
-  learned/
+  magnituder/
   fixed_alpha_*/
   cfg_diff/
 ```

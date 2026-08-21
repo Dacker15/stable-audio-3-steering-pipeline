@@ -2,10 +2,9 @@ r"""
 Trains a `MagnitudePredictor` to steer `SteeringStableAudioPipeline` with a learned, per-sample gain
 on Regime A's deterministic CFG-diff shape ("Regime B", `steering_mode="cfg_diff_magnitude"`).
 
-Where `scripts/train.py` trains `SteeringPredictor` to predict a full per-frame `alpha_t`, this
-script keeps the temporal profile (`pipelines.compute_cfg_diff_shape`) entirely deterministic and
-learns only its scalar gain, `magnitude`. `alpha_min`, `alpha_max` and the shape quantiles stay
-fixed, matching Regime A.
+Unlike a learned model that predicts a full per-frame `alpha_t`, this script keeps the temporal
+profile (`pipelines.compute_cfg_diff_shape`) entirely deterministic and learns only its scalar gain,
+`magnitude`. `alpha_min`, `alpha_max` and the shape quantiles stay fixed, matching Regime A.
 
 The loss combines three terms (see `spec-loss-regime-b.md`):
 
@@ -343,7 +342,7 @@ def plot_loss_curve(history: dict, path: Path) -> None:
     r"""
     Writes the optimized loss and both CLAP cosine similarities, one point per training iteration.
 
-    Same two-panel layout as `scripts/train.py`'s own plot: loss and similarities have unrelated
+    Two stacked panels rather than one plot with two y-scales: loss and similarities have unrelated
     ranges, so they get separate panels, while `s_t`/`s_r` share the cosine scale and reading one
     against the other is the suppression/retain trade-off itself.
     """
@@ -467,10 +466,10 @@ def plot_magnitude_schedule(history: dict, path: Path) -> None:
     r"""
     Writes the mean predicted `magnitude` against the denoising-loop step, one line per epoch.
 
-    Load-bearing diagnostic, same rationale as `scripts/train.py`'s `plot_alpha_schedule`: shows
-    whether the predictor learned a schedule that varies along the trajectory or collapsed to a
-    constant. Unlike `alpha_field`, `magnitude` always lives in `[0, 1]` regardless of `alpha_min`/
-    `alpha_max`, so the y-axis is fixed rather than derived from the CLI bounds.
+    Load-bearing diagnostic: shows whether the predictor learned a schedule that varies along the
+    trajectory or collapsed to a constant. Unlike `alpha_field`, `magnitude` always lives in `[0, 1]`
+    regardless of `alpha_min`/`alpha_max`, so the y-axis is fixed rather than derived from the CLI
+    bounds.
     """
     epochs = history["epochs"]
     args = history["args"]

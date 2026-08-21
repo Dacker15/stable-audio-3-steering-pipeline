@@ -54,16 +54,16 @@ def compute_cfg_diff_alpha(
     r"""
     Deterministic, per-frame `alpha_t`, derived from the norm of the CFG-diff (full vs retain).
 
-    This is "Regime A": a zero-cost, training-free alternative to `SteeringPredictor` for
-    `SteeringStableAudioPipeline`. Where the predictor learns `alpha_t` from the latents, this
-    reads it directly off the signal `SteeringDiffusionTransformer` already computes at every
-    steered step, the difference between the full-prompt and retain-prompt classifier-free
+    This is "Regime A": a zero-cost, training-free alternative to a learned per-frame steering
+    model for `SteeringStableAudioPipeline`. Where a learned model predicts `alpha_t` from the
+    latents, this reads it directly off the signal `SteeringDiffusionTransformer` already computes
+    at every steered step, the difference between the full-prompt and retain-prompt classifier-free
     guidance predictions.
 
     Args:
         full_cfg, retain_cfg (`torch.Tensor`): Guided predictions, shape `(batch_size, channels,
             frames)`.
-        alpha_min, alpha_max (`float`): Same bounds `SteeringPredictor` uses, for compatibility.
+        alpha_min, alpha_max (`float`): Same bounds `"learned"` mode uses, for compatibility.
         magnitude (`float`): Global gain in `[0, 1]`, a fixed hyperparameter rather than a learned
             one in this regime.
         quantile_low, quantile_high (`float`, *optional*): Percentiles used for the robust

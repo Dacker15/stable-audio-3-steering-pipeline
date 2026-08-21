@@ -29,20 +29,16 @@ from stable_audio_3.models.lora import has_lora
 
 from pipelines.cfg_diff_alpha import compute_cfg_diff_alpha, compute_cfg_diff_shape
 
-# Stamped into every checkpoint and checked by the evaluator: a predictor is only meaningful for the
-# backbone and the guidance formula it was fitted against.
-STEERING_MODE = "sa3_full_to_retain_v1"
-
 # Stamped into `MagnitudePredictor` checkpoints trained against `"cfg_diff_magnitude"` mode (Regime
-# B), distinct from `STEERING_MODE` because the two predict different things (a full per-frame alpha
-# field vs. a single per-sample gain on the deterministic CFG-diff shape) and are not interchangeable.
+# B): a predictor is only meaningful for the backbone and the guidance formula it was fitted against,
+# so the evaluator rejects a checkpoint whose stamp doesn't match.
 STEERING_MODE_MAGNITUDE = "sa3_cfg_diff_magnitude_v1"
 
-# `SteeringPredictor` embeds the timestep with `diffusers`' `Timesteps`, whose frequencies are
-# calibrated for the 0-1000 integer timesteps of a discrete scheduler. A rectified flow sigma lives
-# in `[0, 1]`, where every one of those frequencies collapses towards `sin = 0, cos = 1` and the
-# predictor would be effectively blind to where it is on the trajectory. Rescaling restores the
-# range the embedding was designed for without touching the predictor.
+# Learned steering models that embed the timestep with `diffusers`' `Timesteps` (e.g.
+# `MagnitudePredictor`) have frequencies calibrated for the 0-1000 integer timesteps of a discrete
+# scheduler. A rectified flow sigma lives in `[0, 1]`, where every one of those frequencies collapses
+# towards `sin = 0, cos = 1` and the model would be effectively blind to where it is on the
+# trajectory. Rescaling restores the range the embedding was designed for without touching the model.
 PREDICTOR_TIMESTEP_SCALE = 1000.0
 
 
@@ -96,8 +92,8 @@ class SteeringState:
     step: int | None = None
     records: list[tuple[int, float]] = field(default_factory=list)
     # Regime A (`mode="cfg_diff"`): deterministic, per-frame `alpha_t` from the CFG-diff norm,
-    # computed by `compute_cfg_diff_alpha` instead of calling `steering_model`. `alpha_min` /
-    # `alpha_max` mirror `SteeringPredictor`'s own bounds for compatibility between the two modes.
+    # computed by `compute_cfg_diff_alpha` instead of calling `steering_model`, sharing `alpha_min`/
+    # `alpha_max` with `"learned"` mode's own bounds for compatibility between the two modes.
     # Regime B (`mode="cfg_diff_magnitude"`): same deterministic `shape`, but `magnitude` is a
     # learned per-sample scalar from `steering_model` (a `MagnitudePredictor`) instead of the fixed
     # `magnitude` float below.
@@ -203,10 +199,9 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
         Returns `alpha_t` of shape `(batch_size, 1, 1)`, broadcasting over Stable Audio 3's
         `(batch_size, channels, frames)` latents.
 
-        `SteeringPredictor` is a 2D convolutional encoder, so a singleton height axis is added here
-        rather than changing the predictor. Its 3x3 convolutions with padding 1 and its stride-2
-        downsamplers all map a height of 1 to a height of 1, so nothing about the predictor assumes a
-        spectrogram.
+        `"learned"` mode adds a singleton height axis here rather than requiring every steering model
+        to do it, so 2D-convolutional-encoder-style models can consume the latents as a spectrogram
+        of height 1 without any special-casing elsewhere.
         """
         hidden_states = latents.unsqueeze(-2)
         timestep = t * PREDICTOR_TIMESTEP_SCALE
@@ -685,9 +680,8 @@ class SteeringStableAudioPipeline:
             steering_frac_end (`float`, *optional*, defaults to 1.0): Fraction of the denoising loop
                 (by step index) where steering ends.
             alpha_min, alpha_max (`float`, *optional*, defaults to 0.0 and 1.0): Bounds of `alpha_t`
-                in `"cfg_diff"`/`"cfg_diff_magnitude"` mode, matching `SteeringPredictor`'s own
-                defaults for compatibility. Unused in `"learned"` mode, where the bounds live in
-                `steering_model` instead.
+                in `"cfg_diff"`/`"cfg_diff_magnitude"` mode. Unused in `"learned"` mode, where the
+                bounds live in `steering_model` instead.
             alpha_magnitude (`float`, *optional*, defaults to 0.6): Global gain in `[0, 1]` for
                 `"cfg_diff"` mode, a fixed hyperparameter rather than a learned one. Unused in
                 `"learned"` and `"cfg_diff_magnitude"` mode, where the gain is learned instead.
@@ -731,8 +725,8 @@ class SteeringStableAudioPipeline:
         if steering_mode == "cfg_diff" and steering_model is not None:
             raise ValueError(
                 "`steering_model` has to be `None` when `steering_mode` is 'cfg_diff': that mode derives"
-                " `alpha_t` deterministically from the CFG-diff and needs no learned model, so `SteeringPredictor`"
-                " should not even be instantiated for it."
+                " `alpha_t` deterministically from the CFG-diff and needs no learned model, so no steering model"
+                " should even be instantiated for it."
             )
 
         steering_requested = steering_model is not None or steering_mode == "cfg_diff"

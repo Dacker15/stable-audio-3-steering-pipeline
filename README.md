@@ -28,25 +28,28 @@ This creates 132 training rows, 44 validation rows and 44 test rows.
 
 ## Train
 
+`scripts/train_regime_b.py` trains a `MagnitudePredictor`: a learned per-sample gain on Regime A's
+deterministic CFG-diff shape ("Regime B", `steering_mode="cfg_diff_magnitude"`).
+
 ```powershell
-uv run python scripts/train.py `
+uv run python scripts/train_regime_b.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
-  --output outputs/trumpet-target-specific `
-  --model medium-base --cfg-scale 7.0 --num-inference-steps 50
+  --output outputs/trumpet-regime-b `
+  --epochs 5 --margin-target 0.30 --margin-retain 0.40 `
+  --lambda-reg 0.01 --lambda-reg-warmup-steps 200 --lambda-fid 0.1
 ```
 
-`alpha` starts at `0.15`: `0` follows full-prompt guidance and `1` follows retain-prompt guidance.
-The existing weighted target/retain loss is unchanged. CLAP is loaded on its own — Stable Audio 3
-conditions on T5Gemma — and provides both the loss and the target embedding the predictor is
-conditioned on.
+CLAP is loaded on its own — Stable Audio 3 conditions on T5Gemma — and provides both the loss and
+the target embedding the predictor is conditioned on. `scripts/evaluate.py` also has a zero-cost,
+training-free `cfg-diff` method that needs no checkpoint at all.
 
 ## Evaluate
 
 ```powershell
 uv run python scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
-  --checkpoint outputs/trumpet-target-specific/steering_predictor_best.pt `
-  --output outputs/trumpet-target-specific-validation
+  --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
+  --output outputs/trumpet-regime-b-validation
 ```
 
 See [EVALUATION.md](EVALUATION.md) for the full paired evaluation workflow.
