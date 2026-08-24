@@ -9,29 +9,39 @@ profile (`pipelines.compute_cfg_diff_shape`) entirely deterministic and learns o
 The loss combines three terms (see `spec-loss-regime-b.md`):
 
 * a margin hinge contrast (`losses.HingeClapLoss`) between the CLAP audio embedding and the
-  steering target (maximized past `--margin-target`) and retain prompt (minimized past
-  `--margin-retain`), rather than an unbounded contrast that always rewards steering harder;
+  steering target (maximized past `margin_target`) and retain prompt (minimized past
+  `margin_retain`), rather than an unbounded contrast that always rewards steering harder;
 * a minimal-intervention penalty (`losses.minimal_intervention_penalty`) on `alpha_field` itself,
-  weighted by `--lambda-reg` after a linear warmup (`--lambda-reg-warmup-steps`), so the predictor
+  weighted by `lambda_reg` after a linear warmup (`lambda_reg_warmup_steps`), so the predictor
   only pays the cost of intervening where the hinge terms still have gradient to give;
 * a fidelity loss (`losses.pingpong_fidelity_loss`) that penalizes the steered x̂0 estimate for
   drifting from the non-steered one wherever the CFG-diff shape found nothing to correct.
 
-`--margin-target`, `--margin-retain`, `--lambda-reg`, `--lambda-reg-warmup-steps` and `--lambda-fid`
-have no principled default and are required. `outputs/07_cfg_diff_evaluation/results.csv`'s
-`target_similarity`/`retain_similarity` columns (method `cfg_diff`) are Regime A output on a fixed
-`magnitude`, a starting sample for picking margins by listening to a batch of generations at
-different similarity levels.
+Every steering/loss/optimization hyperparameter above is read from `--experiments-csv`, one row
+per experiment, rather than from individual CLI flags: this script trains every row in one process
+(reusing the Stable Audio 3 and CLAP loads across experiments) and writes back a copy of that CSV
+with a `best_model_path` column, repo-root-relative, pointing at each experiment's best checkpoint
+(or `FAILED: <error>` if that experiment's training run raised — the sweep continues past a failed
+row). `outputs/07_cfg_diff_evaluation/results.csv`'s `target_similarity`/`retain_similarity` columns
+(method `cfg_diff`) are Regime A output on a fixed `magnitude`, a starting sample for picking margins
+by listening to a batch of generations at different similarity levels.
 
 Example:
     uv run python scripts/train_regime_b.py --dataset datasets/trumpet_simple_splits/train.csv \
         --validation-dataset datasets/trumpet_simple_splits/val.csv --batch-size 2 \
-        --output outputs/trumpet-regime-b --epochs 5 --margin-target 0.30 --margin-retain 0.40 \
-        --lambda-reg 0.01 --lambda-reg-warmup-steps 200 --lambda-fid 0.1
+        --output outputs/trumpet-regime-b --experiments-csv experiments/regime_b_sweep.csv
+
+`experiments/regime_b_sweep.csv` must contain exactly these columns: `name`,
+`steering_frac_start`, `steering_frac_end`, `alpha_min`, `alpha_max`, `quantile_low`,
+`quantile_high`, `magnitude_init`, `margin_target`, `margin_retain`, `retain_weight`,
+`lambda_reg`, `lambda_reg_warmup_steps`, `lambda_fid`, `epochs`, `lr`, `weight_decay`,
+`grad_accum_steps`, `max_grad_norm`.
 """
 
 import argparse
+import csv
 import json
+import traceback
 from collections import defaultdict
 from pathlib import Path
 
@@ -64,6 +74,53 @@ PALETTE = {
     "series_3": "#39875b",
 }
 ORDINAL_BLUE = ("#86b6ef", "#3987e5", "#256abf", "#184f95", "#0d366b")
+
+# The experiments CSV's required columns, in write-back order. `read_experiments_csv` rejects any
+# CSV whose header isn't exactly this set, and `main` writes the output CSV with these columns plus
+# `best_model_path` appended.
+EXPERIMENT_CSV_FIELDS = [
+    "name",
+    "steering_frac_start",
+    "steering_frac_end",
+    "alpha_min",
+    "alpha_max",
+    "quantile_low",
+    "quantile_high",
+    "magnitude_init",
+    "margin_target",
+    "margin_retain",
+    "retain_weight",
+    "lambda_reg",
+    "lambda_reg_warmup_steps",
+    "lambda_fid",
+    "epochs",
+    "lr",
+    "weight_decay",
+    "grad_accum_steps",
+    "max_grad_norm",
+]
+EXPERIMENT_FLOAT_FIELDS = [
+    "steering_frac_start",
+    "steering_frac_end",
+    "alpha_min",
+    "alpha_max",
+    "quantile_low",
+    "quantile_high",
+    "magnitude_init",
+    "margin_target",
+    "margin_retain",
+    "retain_weight",
+    "lambda_reg",
+    "lambda_fid",
+    "lr",
+    "weight_decay",
+    "max_grad_norm",
+]
+EXPERIMENT_INT_FIELDS = ["lambda_reg_warmup_steps", "epochs", "grad_accum_steps"]
+# `evaluate.py` always runs a "base" and "cfg_diff" method and names its fixed-alpha methods
+# `fixed_alpha_*`; an experiment name colliding with one of those would silently merge results when
+# the output CSV is fed into evaluate.py later.
+RESERVED_METHOD_NAMES = {"base", "cfg_diff"}
 
 
 def steered_step_indices(num_inference_steps: int, steering_frac_start: float, steering_frac_end: float) -> list[int]:
@@ -98,11 +155,123 @@ def magnitude_step_records(alpha_field_records: list[dict]) -> list[tuple[int, f
     return [(int(record["step"]), float(record["magnitude"].mean())) for record in alpha_field_records]
 
 
+def read_experiments_csv(path: Path) -> list[dict[str, str]]:
+    r"""
+    Reads and validates the sweep's experiments CSV.
+
+    Enforces the header is exactly `EXPERIMENT_CSV_FIELDS` (no missing, no extra columns) and that
+    every row's `name` is non-empty, filesystem-safe, unique, and not reserved by `evaluate.py`'s
+    built-in methods. Returns the raw string rows; numeric parsing and range validation happens in
+    `parse_experiment_params`.
+    """
+    with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = list(reader.fieldnames or [])
+        missing = [field for field in EXPERIMENT_CSV_FIELDS if field not in fieldnames]
+        extra = [field for field in fieldnames if field not in EXPERIMENT_CSV_FIELDS]
+        if missing or extra:
+            raise ValueError(
+                f"{path} has to contain exactly the columns {EXPERIMENT_CSV_FIELDS}, but"
+                f"{f' is missing {missing}' if missing else ''}{f' has unexpected columns {extra}' if extra else ''}"
+            )
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"{path} contains no experiment rows")
+
+    seen_names: set[str] = set()
+    for row_number, row in enumerate(rows, start=2):  # header is row 1
+        name = row["name"].strip()
+        if not name:
+            raise ValueError(f"row {row_number}: 'name' cannot be empty")
+        if "/" in name or "\\" in name:
+            raise ValueError(f"row {row_number}: 'name' {name!r} cannot contain path separators")
+        if name in RESERVED_METHOD_NAMES or name.startswith("fixed_alpha_"):
+            raise ValueError(
+                f"row {row_number}: 'name' {name!r} is reserved for evaluate.py's built-in methods"
+                " (base, cfg_diff, fixed_alpha_*)"
+            )
+        if name in seen_names:
+            raise ValueError(f"row {row_number}: duplicate experiment name {name!r}")
+        seen_names.add(name)
+        row["name"] = name
+
+    return rows
+
+
+def parse_experiment_params(row: dict[str, str], row_number: int, num_inference_steps: int) -> dict:
+    r"""
+    Converts one experiment CSV row to typed values and validates it, mirroring the range checks the
+    single-run CLI used to perform on `--margin-target`, `--alpha-min`, etc. Raises `ValueError` with
+    the experiment's name and CSV row number on any invalid value.
+    """
+    name = row["name"]
+    label = f"experiment {name!r} (row {row_number})"
+    params: dict = {"name": name}
+    try:
+        for field in EXPERIMENT_FLOAT_FIELDS:
+            params[field] = float(row[field])
+        for field in EXPERIMENT_INT_FIELDS:
+            params[field] = int(row[field])
+    except ValueError as error:
+        raise ValueError(f"{label}: could not parse numeric field: {error}") from error
+
+    if params["retain_weight"] < 0.0:
+        raise ValueError(f"{label}: retain_weight has to be non-negative but is {params['retain_weight']}")
+    if params["alpha_min"] >= params["alpha_max"]:
+        raise ValueError(
+            f"{label}: alpha_min has to be smaller than alpha_max but got"
+            f" {params['alpha_min']} >= {params['alpha_max']}"
+        )
+    if not 0.0 <= params["quantile_low"] < params["quantile_high"] <= 1.0:
+        raise ValueError(
+            f"{label}: quantile_low and quantile_high have to satisfy 0.0 <= low < high <= 1.0 but are"
+            f" {params['quantile_low']} and {params['quantile_high']}"
+        )
+    if not 0.0 < params["magnitude_init"] < 1.0:
+        raise ValueError(f"{label}: magnitude_init has to lie strictly inside (0, 1) but is {params['magnitude_init']}")
+    if not -1.0 <= params["margin_target"] <= 1.0:
+        raise ValueError(f"{label}: margin_target has to be a cosine similarity in [-1, 1] but is {params['margin_target']}")
+    if not -1.0 <= params["margin_retain"] <= 1.0:
+        raise ValueError(f"{label}: margin_retain has to be a cosine similarity in [-1, 1] but is {params['margin_retain']}")
+    if params["lambda_reg"] < 0.0:
+        raise ValueError(f"{label}: lambda_reg has to be non-negative but is {params['lambda_reg']}")
+    if params["lambda_reg_warmup_steps"] < 0:
+        raise ValueError(
+            f"{label}: lambda_reg_warmup_steps has to be non-negative but is {params['lambda_reg_warmup_steps']}"
+        )
+    if params["lambda_fid"] < 0.0:
+        raise ValueError(f"{label}: lambda_fid has to be non-negative but is {params['lambda_fid']}")
+    if not 0.0 <= params["steering_frac_start"] < params["steering_frac_end"] <= 1.0:
+        raise ValueError(
+            f"{label}: steering_frac_start and steering_frac_end have to satisfy 0.0 <= start < end <= 1.0"
+            f" but are {params['steering_frac_start']} and {params['steering_frac_end']}"
+        )
+    if params["epochs"] < 1:
+        raise ValueError(f"{label}: epochs has to be at least 1 but is {params['epochs']}")
+    if params["grad_accum_steps"] < 1:
+        raise ValueError(f"{label}: grad_accum_steps has to be at least 1 but is {params['grad_accum_steps']}")
+
+    num_steered_steps = len(
+        steered_step_indices(num_inference_steps, params["steering_frac_start"], params["steering_frac_end"])
+    )
+    if num_steered_steps == 0:
+        raise ValueError(
+            f"{label}: the steering window [{params['steering_frac_start']}, {params['steering_frac_end']}) contains"
+            f" no step of the {num_inference_steps} denoising steps, so the predictor would receive no gradient."
+            " Widen the window or raise --num-inference-steps."
+        )
+    params["num_steered_steps"] = num_steered_steps
+
+    return params
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a MagnitudePredictor for Regime B (cfg_diff_magnitude): a learned per-sample gain on Regime"
-            " A's deterministic CFG-diff shape."
+            "Train a batch of MagnitudePredictor experiments for Regime B (cfg_diff_magnitude): a learned"
+            " per-sample gain on Regime A's deterministic CFG-diff shape, one experiment per row of"
+            " --experiments-csv."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -112,15 +281,15 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=Path,
         required=True,
-        help="CSV with prompt,target and preferably an explicit retain_prompt column",
+        help="CSV with prompt,target and preferably an explicit retain_prompt column, shared by every experiment",
     )
     data.add_argument(
         "--validation-dataset",
         type=Path,
         default=None,
-        help="CSV with the same schema as --dataset, held out and evaluated once per epoch",
+        help="CSV with the same schema as --dataset, held out and evaluated once per epoch, shared by every experiment",
     )
-    data.add_argument("--output", type=Path, default=Path("outputs"), help="folder for weights and plots")
+    data.add_argument("--output", type=Path, default=Path("outputs"), help="sweep root folder; each experiment gets a subfolder named after its 'name' column")
     data.add_argument("--batch-size", type=int, default=1, help="prompts generated per forward pass")
     data.add_argument("--max-samples", type=int, default=None, help="use only the first N rows of the dataset")
     data.add_argument(
@@ -130,84 +299,13 @@ def parse_args() -> argparse.Namespace:
         help="use only the first N rows of --validation-dataset",
     )
 
-    steering = parser.add_argument_group("steering")
-    steering.add_argument("--steering-frac-start", type=float, default=0.3, help="fraction of the loop steering starts")
-    steering.add_argument("--steering-frac-end", type=float, default=0.8, help="fraction of the loop steering ends")
-    steering.add_argument(
-        "--alpha-min", type=float, default=0.0, help="lower bound of alpha_field, fixed as in Regime A"
-    )
-    steering.add_argument(
-        "--alpha-max", type=float, default=5.0, help="upper bound of alpha_field, fixed as in Regime A"
-    )
-    steering.add_argument(
-        "--quantile-low",
-        type=float,
-        default=0.10,
-        help="low percentile used to normalize the CFG-diff shape profile per sample, fixed as in Regime A",
-    )
-    steering.add_argument(
-        "--quantile-high",
-        type=float,
-        default=0.90,
-        help="high percentile used to normalize the CFG-diff shape profile per sample, fixed as in Regime A",
-    )
-    steering.add_argument(
-        "--magnitude-init",
-        type=float,
-        default=0.15,
-        help="initial predicted magnitude, must lie strictly inside (0, 1)",
-    )
-
-    loss = parser.add_argument_group(
-        "loss",
-        description=(
-            "No principled defaults for these five: see outputs/07_cfg_diff_evaluation/results.csv"
-            " (target_similarity/retain_similarity columns, method cfg_diff) as a starting sample for the margins."
-        ),
-    )
-    loss.add_argument(
-        "--margin-target",
-        type=float,
+    experiments = parser.add_argument_group("experiments")
+    experiments.add_argument(
+        "--experiments-csv",
+        type=Path,
         required=True,
-        help="cosine similarity to the target below which l_target stops giving gradient",
+        help=f"CSV with one row per experiment, columns exactly {EXPERIMENT_CSV_FIELDS}",
     )
-    loss.add_argument(
-        "--margin-retain",
-        type=float,
-        required=True,
-        help="cosine similarity to the retain prompt above which l_retain stops giving gradient",
-    )
-    loss.add_argument(
-        "--retain-weight",
-        type=float,
-        default=1.0,
-        help="weight of l_retain relative to l_target inside l_clap",
-    )
-    loss.add_argument(
-        "--lambda-reg",
-        type=float,
-        required=True,
-        help="target weight of the minimal-intervention penalty, reached after --lambda-reg-warmup-steps",
-    )
-    loss.add_argument(
-        "--lambda-reg-warmup-steps",
-        type=int,
-        required=True,
-        help="optimizer steps to linearly ramp lambda_reg from 0 to its target value; 0 disables warmup",
-    )
-    loss.add_argument(
-        "--lambda-fid",
-        type=float,
-        required=True,
-        help="weight of the ping-pong fidelity loss",
-    )
-
-    optim = parser.add_argument_group("optimization")
-    optim.add_argument("--epochs", type=int, default=5)
-    optim.add_argument("--lr", type=float, default=1e-4)
-    optim.add_argument("--weight-decay", type=float, default=1e-2)
-    optim.add_argument("--grad-accum-steps", type=int, default=4, help="batches accumulated per optimizer step")
-    optim.add_argument("--max-grad-norm", type=float, default=1.0)
 
     generation = parser.add_argument_group("generation")
     generation.add_argument(
@@ -238,7 +336,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     runtime = parser.add_argument_group("runtime")
-    runtime.add_argument("--seed", type=int, default=42)
+    runtime.add_argument("--seed", type=int, default=42, help="reset before every experiment, so each is reproducible independent of sweep order")
     runtime.add_argument(
         "--no-half",
         default=True,
@@ -250,43 +348,11 @@ def parse_args() -> argparse.Namespace:
 
     if args.batch_size < 1:
         raise ValueError(f"`--batch-size` has to be at least 1 but is {args.batch_size}")
-    if args.grad_accum_steps < 1:
-        raise ValueError(f"`--grad-accum-steps` has to be at least 1 but is {args.grad_accum_steps}")
     if args.max_samples is not None and args.max_samples < 1:
         raise ValueError(f"`--max-samples` has to be at least 1 but is {args.max_samples}")
     if args.max_validation_samples is not None and args.max_validation_samples < 1:
         raise ValueError(
             f"`--max-validation-samples` has to be at least 1 but is {args.max_validation_samples}"
-        )
-    if args.retain_weight < 0.0:
-        raise ValueError(f"`--retain-weight` has to be non-negative but is {args.retain_weight}")
-    if args.alpha_min >= args.alpha_max:
-        raise ValueError(
-            f"`--alpha-min` has to be smaller than `--alpha-max` but got {args.alpha_min} >= {args.alpha_max}"
-        )
-    if not 0.0 <= args.quantile_low < args.quantile_high <= 1.0:
-        raise ValueError(
-            "`--quantile-low` and `--quantile-high` have to satisfy `0.0 <= low < high <= 1.0` but are"
-            f" {args.quantile_low} and {args.quantile_high}"
-        )
-    if not 0.0 < args.magnitude_init < 1.0:
-        raise ValueError(f"`--magnitude-init` has to lie strictly inside (0, 1) but is {args.magnitude_init}")
-    if not -1.0 <= args.margin_target <= 1.0:
-        raise ValueError(f"`--margin-target` has to be a cosine similarity in [-1, 1] but is {args.margin_target}")
-    if not -1.0 <= args.margin_retain <= 1.0:
-        raise ValueError(f"`--margin-retain` has to be a cosine similarity in [-1, 1] but is {args.margin_retain}")
-    if args.lambda_reg < 0.0:
-        raise ValueError(f"`--lambda-reg` has to be non-negative but is {args.lambda_reg}")
-    if args.lambda_reg_warmup_steps < 0:
-        raise ValueError(
-            f"`--lambda-reg-warmup-steps` has to be non-negative but is {args.lambda_reg_warmup_steps}"
-        )
-    if args.lambda_fid < 0.0:
-        raise ValueError(f"`--lambda-fid` has to be non-negative but is {args.lambda_fid}")
-    if not 0.0 <= args.steering_frac_start < args.steering_frac_end <= 1.0:
-        raise ValueError(
-            "`--steering-frac-start` and `--steering-frac-end` have to satisfy"
-            f" `0.0 <= start < end <= 1.0` but are {args.steering_frac_start} and {args.steering_frac_end}"
         )
     if args.cfg_scale <= 1.0:
         # the transformer only calls the steering model inside its classifier free guidance branch
@@ -302,17 +368,6 @@ def parse_args() -> argparse.Namespace:
             f"`--model` has to be a `-base` checkpoint but is {args.model!r}. The post-trained checkpoints are"
             " distilled and ignore classifier free guidance, which is where steering is applied."
         )
-
-    num_steered_steps = len(
-        steered_step_indices(args.num_inference_steps, args.steering_frac_start, args.steering_frac_end)
-    )
-    if num_steered_steps == 0:
-        raise ValueError(
-            f"The steering window [{args.steering_frac_start}, {args.steering_frac_end}) contains no step of the"
-            f" {args.num_inference_steps} denoising steps, so the predictor would receive no gradient. Widen the"
-            " window or raise `--num-inference-steps`."
-        )
-    args.num_steered_steps = num_steered_steps
 
     return args
 
@@ -617,87 +672,68 @@ def run_validation(
     }
 
 
-def main() -> None:
-    args = parse_args()
-
-    output_dir = args.output
+def run_experiment(
+    *,
+    pipe: SteeringStableAudioPipeline,
+    clap_loss: ClapLoss,
+    dataloader: DataLoader,
+    validation_loader: DataLoader | None,
+    combined_args: argparse.Namespace,
+    output_dir: Path,
+    device: str,
+) -> dict:
+    r"""
+    Trains one experiment end to end: builds a fresh `MagnitudePredictor`/optimizer from
+    `combined_args` (the shared CLI args merged with one CSV row's steering/loss/optimization
+    values), runs the same epoch loop the single-run CLI used to run in `main`, and writes
+    checkpoints/plots into `output_dir`. `pipe`/`clap_loss` are loaded once and shared across every
+    experiment in the sweep.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
+    (output_dir / "args.json").write_text(json.dumps(vars(combined_args), indent=2, default=str), encoding="utf-8")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(args.seed)
-
-    dataset = PromptTargetDataset(args.dataset, args.max_samples)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=collate_prompt_target,
-    )
-    print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
-
-    validation_loader = None
-    if args.validation_dataset is not None:
-        validation_dataset = PromptTargetDataset(args.validation_dataset, args.max_validation_samples)
-        validation_loader = DataLoader(
-            validation_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=collate_prompt_target,
-        )
-        print(
-            f"Loaded {len(validation_dataset)} validation prompts from {args.validation_dataset} -> "
-            f"{len(validation_loader)} batches"
-        )
-
-    _, example_target, example_retain, _ = dataset.rows[0]
+    _, example_target, example_retain, _ = dataloader.dataset.rows[0]
     print(
-        f"Retain weight {args.retain_weight}, margin_target {args.margin_target}, margin_retain"
-        f" {args.margin_retain}, target {example_target!r}, example retain prompt: {example_retain!r}"
+        f"[{combined_args.name}] Retain weight {combined_args.retain_weight}, margin_target {combined_args.margin_target},"
+        f" margin_retain {combined_args.margin_retain}, target {example_target!r}, example retain prompt:"
+        f" {example_retain!r}"
     )
-
-    print(f"Loading {args.model} on {device} with {'float32' if args.no_half else 'half'} precision")
-    pipe = SteeringStableAudioPipeline.from_pretrained(args.model, device=device, model_half=not args.no_half)
-    pipe.diffusion.requires_grad_(False)
-    pipe.diffusion.eval()
 
     predictor_config = {
         "latent_channels": pipe.io_channels,
-        "target_embed_dim": None,  # filled in below, once CLAP is loaded
-        "magnitude_init": args.magnitude_init,
+        "target_embed_dim": clap_loss.embed_dim,
+        "magnitude_init": combined_args.magnitude_init,
     }
-
-    clap_loss = ClapLoss.from_pretrained().to(device)
-    predictor_config["target_embed_dim"] = clap_loss.embed_dim
-
     predictor = MagnitudePredictor(**predictor_config).to(device)
     num_parameters = sum(parameter.numel() for parameter in predictor.parameters())
-    print(f"MagnitudePredictor: {num_parameters / 1e6:.2f}M parameters, config {predictor_config}")
+    print(f"[{combined_args.name}] MagnitudePredictor: {num_parameters / 1e6:.2f}M parameters, config {predictor_config}")
 
     hinge_loss = HingeClapLoss(
-        clap_loss, margin_target=args.margin_target, margin_retain=args.margin_retain, retain_weight=args.retain_weight
+        clap_loss,
+        margin_target=combined_args.margin_target,
+        margin_retain=combined_args.margin_retain,
+        retain_weight=combined_args.retain_weight,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(predictor.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(predictor.parameters(), lr=combined_args.lr, weight_decay=combined_args.weight_decay)
 
     print(
-        f"Steering {args.num_steered_steps}/{args.num_inference_steps} steps in"
-        f" [{args.steering_frac_start}, {args.steering_frac_end}), {args.audio_length_in_s}s clips,"
-        f" alpha_field in [{args.alpha_min}, {args.alpha_max}]"
+        f"[{combined_args.name}] Steering {combined_args.num_steered_steps}/{combined_args.num_inference_steps} steps in"
+        f" [{combined_args.steering_frac_start}, {combined_args.steering_frac_end}), {combined_args.audio_length_in_s}s clips,"
+        f" alpha_field in [{combined_args.alpha_min}, {combined_args.alpha_max}]"
     )
 
     history: dict = {
-        "args": json.loads(json.dumps(vars(args), default=str)),
+        "args": json.loads(json.dumps(vars(combined_args), default=str)),
         "checkpoint_selection_metric": "validation_loss" if validation_loader is not None else "training_loss",
         "iterations": [],
         "epochs": [],
     }
     best_metric = float("inf")
+    best_model_path = output_dir / "magnitude_predictor_best.pt"
     step = 0
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, combined_args.epochs + 1):
         predictor.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -711,7 +747,7 @@ def main() -> None:
             if seeds[0] is not None:
                 generator = [torch.Generator().manual_seed(seed) for seed in seeds]
             else:
-                generator = torch.Generator().manual_seed(args.seed + step)
+                generator = torch.Generator().manual_seed(combined_args.seed + step)
 
             output = pipe(
                 prompt=prompts,
@@ -719,17 +755,17 @@ def main() -> None:
                 target_embed=clap_loss.encode_text(targets),
                 steering_model=predictor,
                 steering_mode="cfg_diff_magnitude",
-                steering_frac_start=args.steering_frac_start,
-                steering_frac_end=args.steering_frac_end,
-                alpha_min=args.alpha_min,
-                alpha_max=args.alpha_max,
-                alpha_shape_quantile_low=args.quantile_low,
-                alpha_shape_quantile_high=args.quantile_high,
+                steering_frac_start=combined_args.steering_frac_start,
+                steering_frac_end=combined_args.steering_frac_end,
+                alpha_min=combined_args.alpha_min,
+                alpha_max=combined_args.alpha_max,
+                alpha_shape_quantile_low=combined_args.quantile_low,
+                alpha_shape_quantile_high=combined_args.quantile_high,
                 train=True,
-                num_inference_steps=args.num_inference_steps,
-                audio_length_in_s=args.audio_length_in_s,
-                cfg_scale=args.cfg_scale,
-                apg_scale=args.apg_scale,
+                num_inference_steps=combined_args.num_inference_steps,
+                audio_length_in_s=combined_args.audio_length_in_s,
+                cfg_scale=combined_args.cfg_scale,
+                apg_scale=combined_args.apg_scale,
                 generator=generator,
                 output_type="latent",
             )
@@ -737,21 +773,21 @@ def main() -> None:
             epoch_magnitude_records.extend(magnitude_step_records(output.alpha_field_records))
 
             waveform = pipe.decode_latents(
-                latents, padding_mask=output.padding_mask, audio_length_in_s=args.audio_length_in_s
+                latents, padding_mask=output.padding_mask, audio_length_in_s=combined_args.audio_length_in_s
             )
             audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
 
-            lambda_reg_t = linear_warmup(step, args.lambda_reg, args.lambda_reg_warmup_steps)
+            lambda_reg_t = linear_warmup(step, combined_args.lambda_reg, combined_args.lambda_reg_warmup_steps)
             loss, metrics = compute_losses(
-                output, audio_embeds, targets, retains, hinge_loss, lambda_reg_t, args.lambda_fid
+                output, audio_embeds, targets, retains, hinge_loss, lambda_reg_t, combined_args.lambda_fid
             )
 
-            (loss / args.grad_accum_steps).backward()
+            (loss / combined_args.grad_accum_steps).backward()
 
             grad_norm = None
             is_last_batch = batch_index == len(dataloader) - 1
-            if (batch_index + 1) % args.grad_accum_steps == 0 or is_last_batch:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(predictor.parameters(), args.max_grad_norm))
+            if (batch_index + 1) % combined_args.grad_accum_steps == 0 or is_last_batch:
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(predictor.parameters(), combined_args.max_grad_norm))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -787,7 +823,7 @@ def main() -> None:
                 }
             )
             print(
-                f"epoch {epoch}/{args.epochs} batch {batch_index + 1}/{len(dataloader)}"
+                f"[{combined_args.name}] epoch {epoch}/{combined_args.epochs} batch {batch_index + 1}/{len(dataloader)}"
                 f" loss {loss_value:+.4f} s_t {s_t:+.4f} s_r {s_r:+.4f} lambda_reg {lambda_reg_t:.4g}"
                 f" magnitude[min/mean/max] {metrics['magnitude_min']:.3f}/{metrics['magnitude_mean']:.3f}/"
                 f"{metrics['magnitude_max']:.3f} both_satisfied {metrics['both_satisfied_frac']:.2f}"
@@ -805,7 +841,7 @@ def main() -> None:
             "magnitude_by_step": mean_value_by_step(epoch_magnitude_records),
             "validation": None,
         }
-        print(f"epoch {epoch}/{args.epochs} mean loss {epoch_loss:+.4f}")
+        print(f"[{combined_args.name}] epoch {epoch}/{combined_args.epochs} mean loss {epoch_loss:+.4f}")
 
         validation_metrics = None
         if validation_loader is not None:
@@ -815,11 +851,11 @@ def main() -> None:
                 clap_loss=clap_loss,
                 hinge_loss=hinge_loss,
                 dataloader=validation_loader,
-                args=args,
+                args=combined_args,
             )
             epoch_record["validation"] = validation_metrics
             print(
-                f"epoch {epoch}/{args.epochs} validation loss {validation_metrics['loss']:+.4f} "
+                f"[{combined_args.name}] epoch {epoch}/{combined_args.epochs} validation loss {validation_metrics['loss']:+.4f} "
                 f"s_t {validation_metrics['s_t']:+.4f} s_r {validation_metrics['s_r']:+.4f}"
             )
 
@@ -830,7 +866,7 @@ def main() -> None:
             "state_dict": predictor.state_dict(),
             "config": predictor_config,
             "steering_mode": STEERING_MODE_MAGNITUDE,
-            "model": args.model,
+            "model": combined_args.model,
             "args": history["args"],
             "epoch": epoch,
             "loss": epoch_loss,
@@ -841,7 +877,7 @@ def main() -> None:
         torch.save(checkpoint, output_dir / "magnitude_predictor.pt")
         if metric_value < best_metric:
             best_metric = metric_value
-            torch.save(checkpoint, output_dir / "magnitude_predictor_best.pt")
+            torch.save(checkpoint, best_model_path)
 
         (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
         plot_loss_curve(history, output_dir / "loss_curve.png")
@@ -849,7 +885,103 @@ def main() -> None:
         plot_magnitude_schedule(history, output_dir / "magnitude_schedule.png")
 
     metric_label = "validation loss" if validation_loader is not None else "training loss"
-    print(f"\nDone. Best {metric_label} {best_metric:+.4f}. Artifacts in {output_dir.resolve()}")
+    print(f"[{combined_args.name}] Done. Best {metric_label} {best_metric:+.4f}. Artifacts in {output_dir.resolve()}")
+
+    return {"best_model_path": best_model_path, "best_metric": best_metric}
+
+
+def main() -> None:
+    args = parse_args()
+    repo_root = Path(__file__).resolve().parents[1]
+
+    output_root = args.output
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    raw_rows = read_experiments_csv(args.experiments_csv)
+    experiments = [
+        parse_experiment_params(row, row_number, args.num_inference_steps)
+        for row_number, row in enumerate(raw_rows, start=2)
+    ]
+    print(f"Loaded {len(experiments)} experiments from {args.experiments_csv}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset = PromptTargetDataset(args.dataset, args.max_samples)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_prompt_target,
+    )
+    print(f"Loaded {len(dataset)} prompts from {args.dataset} -> {len(dataloader)} batches per epoch")
+
+    validation_loader = None
+    if args.validation_dataset is not None:
+        validation_dataset = PromptTargetDataset(args.validation_dataset, args.max_validation_samples)
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_prompt_target,
+        )
+        print(
+            f"Loaded {len(validation_dataset)} validation prompts from {args.validation_dataset} -> "
+            f"{len(validation_loader)} batches"
+        )
+
+    print(f"Loading {args.model} on {device} with {'float32' if args.no_half else 'half'} precision")
+    pipe = SteeringStableAudioPipeline.from_pretrained(args.model, device=device, model_half=not args.no_half)
+    pipe.diffusion.requires_grad_(False)
+    pipe.diffusion.eval()
+
+    clap_loss = ClapLoss.from_pretrained().to(device)
+
+    output_fieldnames = EXPERIMENT_CSV_FIELDS + ["best_model_path"]
+    output_rows: list[dict] = [{field: raw_row[field] for field in EXPERIMENT_CSV_FIELDS} for raw_row in raw_rows]
+    results_path = output_root / "experiments.csv"
+
+    def write_results() -> None:
+        with results_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=output_fieldnames)
+            writer.writeheader()
+            writer.writerows(output_rows)
+
+    num_succeeded = 0
+    num_failed = 0
+    for index, experiment_params in enumerate(experiments):
+        name = experiment_params["name"]
+        print(f"\n=== Experiment {index + 1}/{len(experiments)}: {name} ===", flush=True)
+        combined_args = argparse.Namespace(**{**vars(args), **experiment_params})
+        experiment_output_dir = output_root / name
+        torch.manual_seed(args.seed)
+        try:
+            if experiment_output_dir.exists() and any(experiment_output_dir.iterdir()):
+                raise FileExistsError(f"experiment output {experiment_output_dir} is not empty")
+            result = run_experiment(
+                pipe=pipe,
+                clap_loss=clap_loss,
+                dataloader=dataloader,
+                validation_loader=validation_loader,
+                combined_args=combined_args,
+                output_dir=experiment_output_dir,
+                device=device,
+            )
+            output_rows[index]["best_model_path"] = (
+                result["best_model_path"].resolve().relative_to(repo_root).as_posix()
+            )
+            num_succeeded += 1
+        except Exception as error:
+            traceback.print_exc()
+            output_rows[index]["best_model_path"] = f"FAILED: {error}"
+            num_failed += 1
+        write_results()
+
+    print(
+        f"\nDone. {num_succeeded}/{len(experiments)} experiments succeeded, {num_failed} failed."
+        f" Results written to {results_path.resolve()}"
+    )
 
 
 if __name__ == "__main__":

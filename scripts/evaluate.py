@@ -1,25 +1,28 @@
 r"""
 Evaluates steering methods against the unsteered Stable Audio 3 baseline.
 
-The evaluator runs up to 4 independent steps against the same paired noise: an always-on ``base``
-reference (constant ``alpha=0``, i.e. plain full-prompt CFG), the ``magnituder`` pipeline (needs a
-``MagnitudePredictor`` checkpoint from ``scripts/train_regime_b.py``), the ``fixed-alpha`` pipeline
-(constant-alpha controls) and the ``cfg-diff`` pipeline (deterministic, training-free). Each of the
-latter three has its own prefixed CLI parameters, so passing e.g. ``--cfg-diff-cfg-scale`` never
-affects the ``magnituder`` pipeline's generation settings and vice versa.
+The evaluator runs an always-on ``base`` reference (constant ``alpha=0``, i.e. plain full-prompt
+CFG), one ``magnituder`` method per row of ``--experiments-csv`` (the CSV written by
+``scripts/train_regime_b.py``, each row a ``MagnitudePredictor`` checkpoint named after its
+``name`` column), the ``fixed-alpha`` pipeline (constant-alpha controls) and the ``cfg-diff``
+pipeline (deterministic, training-free). Each magnituder experiment's steering bounds and
+generation settings are read from its own checkpoint's stored training args, not from CLI flags,
+since a sweep's rows can use different steering windows; ``fixed-alpha`` and ``cfg-diff`` remain
+configured exclusively from their own prefixed CLI parameters, so passing e.g.
+``--cfg-diff-cfg-scale`` never affects the other pipelines' generation settings and vice versa.
 
-Example smoke test (using a checkpoint produced by ``scripts/train_regime_b.py``):
+Example smoke test (using the CSV produced by ``scripts/train_regime_b.py``):
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/validation.csv \
-        --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt \
-        --output outputs/eval-smoke --max-samples 4 --num-seeds 1 --magnituder-num-inference-steps 20
+        --experiments-csv outputs/trumpet-regime-b/experiments.csv \
+        --output outputs/eval-smoke --max-samples 4 --num-seeds 1
 
 Example final run with fixed-alpha controls:
 
     uv run python scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
-        --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt \
+        --experiments-csv outputs/trumpet-regime-b/experiments.csv \
         --output outputs/eval-final --num-seeds 5 \
         --fixed-alpha-values 0.25 0.5 0.75 1.0
 
@@ -29,8 +32,10 @@ Example cfg-diff-only run (no trained checkpoint required):
         --dataset datasets/trumpet_simple_splits/test.csv \
         --output outputs/eval-cfg-diff-only --num-seeds 3 --fixed-alpha-values
 
-Omitting --magnituder-checkpoint drops the "magnituder" method, since it needs trained weights;
---fixed-alpha-values with no values then leaves "base" and "cfg_diff" as the evaluated methods.
+Omitting --experiments-csv drops the "magnituder" methods entirely, since they need trained
+weights; rows whose ``best_model_path`` starts with ``FAILED:`` (a training run that raised) are
+skipped. --fixed-alpha-values with no values then leaves "base" and "cfg_diff" as the evaluated
+methods.
 """
 
 import argparse
@@ -95,6 +100,15 @@ GENERATION_DEFAULTS: dict[str, float | int] = {
 # (see `SteeringStableAudioPipeline.__call__`'s docstring), so this is what "base" and "fixed_alpha"
 # pass through: harmless placeholders, never read by `mode="learned"`.
 INERT_ALPHA_BOUNDS = (0.0, 1.0, 0.0, 0.10, 0.90)
+
+# Fallback steering bounds for a magnituder experiment whose checkpoint predates a given key; matches
+# what `scripts/train_regime_b.py`'s steering argument group used to default to.
+MAGNITUDER_ALPHA_DEFAULTS: dict[str, float] = {
+    "alpha_min": 0.0,
+    "alpha_max": 5.0,
+    "quantile_low": 0.10,
+    "quantile_high": 0.90,
+}
 
 
 def _flag(prefix: str, name: str) -> str:
@@ -239,36 +253,23 @@ def parse_args() -> argparse.Namespace:
     magnituder = parser.add_argument_group(
         "magnituder pipeline",
         description=(
-            "The 'magnituder' method: MagnitudePredictor loaded from --magnituder-checkpoint, predicting a"
-            " single per-sample magnitude that scales Regime A's deterministic CFG-diff shape into alpha_t."
-            " Skipped entirely when --magnituder-checkpoint is omitted."
+            "One 'magnituder' method per row of --experiments-csv (the CSV written by"
+            " scripts/train_regime_b.py), each a MagnitudePredictor checkpoint predicting a single"
+            " per-sample magnitude that scales Regime A's deterministic CFG-diff shape into alpha_t. Steering"
+            " bounds and generation settings come from each checkpoint's own stored training args, not CLI"
+            " flags, since a sweep's rows can use different steering windows. Skipped entirely when"
+            " --experiments-csv is omitted."
         ),
     )
     magnituder.add_argument(
-        "--magnituder-checkpoint",
+        "--experiments-csv",
         type=Path,
         default=None,
-        help="checkpoint produced by scripts/train_regime_b.py; omit to skip the magnituder pipeline",
+        help=(
+            "CSV written by scripts/train_regime_b.py, needs 'name' and 'best_model_path' columns; rows whose"
+            " best_model_path starts with 'FAILED:' are skipped; omit to skip the magnituder pipeline"
+        ),
     )
-    magnituder.add_argument(
-        "--magnituder-alpha-min", type=float, default=0.0, help="lower bound of the magnituder's alpha_t"
-    )
-    magnituder.add_argument(
-        "--magnituder-alpha-max", type=float, default=5.0, help="upper bound of the magnituder's alpha_t"
-    )
-    magnituder.add_argument(
-        "--magnituder-alpha-quantile-low",
-        type=float,
-        default=0.10,
-        help="low percentile used by magnituder to normalize its temporal profile per sample",
-    )
-    magnituder.add_argument(
-        "--magnituder-alpha-quantile-high",
-        type=float,
-        default=0.90,
-        help="high percentile used by magnituder to normalize its temporal profile per sample",
-    )
-    _add_generation_args(magnituder, "magnituder", "defaults to checkpoint setting")
 
     args = parser.parse_args()
 
@@ -293,15 +294,7 @@ def parse_args() -> argparse.Namespace:
             " 0.0 <= low < high <= 1.0"
         )
 
-    if args.magnituder_alpha_min >= args.magnituder_alpha_max:
-        parser.error("--magnituder-alpha-min must be smaller than --magnituder-alpha-max")
-    if not 0.0 <= args.magnituder_alpha_quantile_low < args.magnituder_alpha_quantile_high <= 1.0:
-        parser.error(
-            "--magnituder-alpha-quantile-low and --magnituder-alpha-quantile-high must satisfy"
-            " 0.0 <= low < high <= 1.0"
-        )
-
-    for prefix in ("fixed_alpha", "cfg_diff", "magnituder"):
+    for prefix in ("fixed_alpha", "cfg_diff"):
         _validate_generation_overrides(parser, args, prefix)
 
     return args
@@ -336,16 +329,69 @@ def _finalize_generation_config(resolved: dict[str, float | int]) -> dict[str, f
     return resolved
 
 
-def resolve_predictor_generation_config(
-    args: argparse.Namespace, checkpoint_args: dict, prefix: str
-) -> dict[str, float | int]:
-    """CLI overrides checkpoint training settings; hard-coded defaults are the last fallback."""
+def resolve_checkpoint_generation_config(checkpoint_args: dict) -> dict[str, float | int]:
+    """Reads generation settings from a magnituder checkpoint's own stored training args; hard-coded
+    defaults are the fallback for a checkpoint predating a given key."""
 
-    resolved = {}
-    for name, fallback in GENERATION_DEFAULTS.items():
-        cli_value = getattr(args, f"{prefix}_{name}")
-        resolved[name] = cli_value if cli_value is not None else checkpoint_args.get(name, fallback)
+    resolved = {name: checkpoint_args.get(name, fallback) for name, fallback in GENERATION_DEFAULTS.items()}
     return _finalize_generation_config(resolved)
+
+
+def resolve_checkpoint_alpha_bounds(checkpoint_args: dict) -> tuple[float, float, float, float, float]:
+    """`(alpha_min, alpha_max, alpha_magnitude, quantile_low, quantile_high)` from a magnituder
+    checkpoint's own stored training args; `alpha_magnitude` is inert, `"cfg_diff_magnitude"` mode never
+    reads `state.magnitude`."""
+
+    alpha_min = float(checkpoint_args.get("alpha_min", MAGNITUDER_ALPHA_DEFAULTS["alpha_min"]))
+    alpha_max = float(checkpoint_args.get("alpha_max", MAGNITUDER_ALPHA_DEFAULTS["alpha_max"]))
+    quantile_low = float(checkpoint_args.get("quantile_low", MAGNITUDER_ALPHA_DEFAULTS["quantile_low"]))
+    quantile_high = float(checkpoint_args.get("quantile_high", MAGNITUDER_ALPHA_DEFAULTS["quantile_high"]))
+    if alpha_min >= alpha_max:
+        raise ValueError(f"checkpoint alpha_min ({alpha_min}) must be smaller than alpha_max ({alpha_max})")
+    if not 0.0 <= quantile_low < quantile_high <= 1.0:
+        raise ValueError(
+            f"checkpoint quantile_low/quantile_high must satisfy 0.0 <= low < high <= 1.0 but are"
+            f" {quantile_low} and {quantile_high}"
+        )
+    return (alpha_min, alpha_max, 0.0, quantile_low, quantile_high)
+
+
+def read_magnituder_experiments(path: Path) -> list[dict[str, str]]:
+    """Reads the CSV written by `scripts/train_regime_b.py`, returning `{"name", "best_model_path"}`
+    dicts for the training experiments that succeeded — rows whose `best_model_path` starts with
+    `"FAILED:"` are training runs that raised, and are skipped with a printed notice."""
+
+    with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = list(reader.fieldnames or [])
+        missing = [field for field in ("name", "best_model_path") if field not in fieldnames]
+        if missing:
+            raise ValueError(
+                f"{path} is missing required column(s) {missing}; it must be the CSV written by"
+                " scripts/train_regime_b.py"
+            )
+        rows = list(reader)
+    if not rows:
+        raise ValueError(f"{path} contains no experiment rows")
+
+    experiments: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for row_number, row in enumerate(rows, start=2):  # header is row 1
+        name = row["name"].strip()
+        if not name:
+            raise ValueError(f"row {row_number}: 'name' cannot be empty")
+        if name in ("base", "cfg_diff") or name.startswith("fixed_alpha_"):
+            raise ValueError(f"row {row_number}: 'name' {name!r} is reserved for evaluate.py's built-in methods")
+        if name in seen_names:
+            raise ValueError(f"row {row_number}: duplicate experiment name {name!r}")
+        seen_names.add(name)
+
+        best_model_path = row["best_model_path"].strip()
+        if best_model_path.startswith("FAILED:"):
+            print(f"Skipping experiment {name!r} (row {row_number}): training failed ({best_model_path})")
+            continue
+        experiments.append({"name": name, "best_model_path": best_model_path})
+    return experiments
 
 
 def resolve_generation_config(args: argparse.Namespace, prefix: str) -> dict[str, float | int]:
@@ -716,33 +762,40 @@ def run_pipeline(
 def main() -> None:
     args = parse_args()
     output_dir = prepare_output_directory(args.output)
+    repo_root = Path(__file__).resolve().parents[1]
 
-    magnituder_checkpoint = None
-    magnituder_checkpoint_args: dict = {}
-    magnituder_config: dict = {}
-    if args.magnituder_checkpoint is not None:
-        magnituder_checkpoint = torch.load(args.magnituder_checkpoint, map_location="cpu", weights_only=False)
-        missing = {"state_dict", "config"} - set(magnituder_checkpoint)
-        if missing:
-            raise ValueError(f"checkpoint {args.magnituder_checkpoint} is missing keys {sorted(missing)}")
-        if "steering_mode" not in magnituder_checkpoint:
-            raise ValueError(f"checkpoint {args.magnituder_checkpoint} predates Regime B and cannot be evaluated")
-        if magnituder_checkpoint["steering_mode"] != STEERING_MODE_MAGNITUDE:
-            raise ValueError(
-                f"checkpoint {args.magnituder_checkpoint} uses steering mode"
-                f" {magnituder_checkpoint['steering_mode']!r}, but --magnituder-checkpoint requires"
-                f" {STEERING_MODE_MAGNITUDE!r} (MagnitudePredictor checkpoints produced by"
-                " scripts/train_regime_b.py)."
+    magnituder_experiments: list[dict] = []
+    if args.experiments_csv is not None:
+        for entry in read_magnituder_experiments(args.experiments_csv):
+            checkpoint_path = (repo_root / entry["best_model_path"]).resolve()
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"experiment {entry['name']!r}: checkpoint {checkpoint_path} does not exist")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            missing = {"state_dict", "config"} - set(checkpoint)
+            if missing:
+                raise ValueError(f"checkpoint {checkpoint_path} is missing keys {sorted(missing)}")
+            if "steering_mode" not in checkpoint:
+                raise ValueError(f"checkpoint {checkpoint_path} predates Regime B and cannot be evaluated")
+            if checkpoint["steering_mode"] != STEERING_MODE_MAGNITUDE:
+                raise ValueError(
+                    f"checkpoint {checkpoint_path} uses steering mode {checkpoint['steering_mode']!r}, but"
+                    f" --experiments-csv requires {STEERING_MODE_MAGNITUDE!r} (MagnitudePredictor checkpoints"
+                    " produced by scripts/train_regime_b.py)."
+                )
+            checkpoint_args = checkpoint.get("args", {})
+            magnituder_experiments.append(
+                {
+                    "name": entry["name"],
+                    "checkpoint_path": checkpoint_path,
+                    "checkpoint": checkpoint,
+                    "checkpoint_args": checkpoint_args,
+                    "config": checkpoint["config"],
+                    "generation_config": resolve_checkpoint_generation_config(checkpoint_args),
+                    "alpha_bounds": resolve_checkpoint_alpha_bounds(checkpoint_args),
+                }
             )
-        magnituder_checkpoint_args = magnituder_checkpoint.get("args", {})
-        magnituder_config = magnituder_checkpoint["config"]
 
     base_generation_config = _finalize_generation_config(dict(GENERATION_DEFAULTS))
-    magnituder_generation_config = (
-        resolve_predictor_generation_config(args, magnituder_checkpoint_args, "magnituder")
-        if magnituder_checkpoint is not None
-        else None
-    )
     fixed_alpha_generation_config = (
         resolve_generation_config(args, "fixed_alpha") if args.fixed_alpha_values else None
     )
@@ -750,20 +803,31 @@ def main() -> None:
 
     dataset = PromptTargetDataset(args.dataset, args.max_samples)
     device = resolve_device(args.device)
-    model_name = (
-        args.model
-        or (magnituder_checkpoint.get("model") if magnituder_checkpoint is not None else None)
-        or "small-music-base"
-    )
-    same_dataset_magnituder = magnituder_checkpoint is not None and _same_dataset_as_training(
-        args.dataset, magnituder_checkpoint_args
-    )
-    if same_dataset_magnituder:
-        warnings.warn(
-            "The evaluation CSV is the same dataset path stored in the magnituder checkpoint. Results measure"
-            " training-set behaviour, not held-out generalization.",
-            stacklevel=2,
+
+    checkpoint_models = {experiment["checkpoint"].get("model") for experiment in magnituder_experiments}
+    checkpoint_models.discard(None)
+    if args.model is not None:
+        model_name = args.model
+    elif len(checkpoint_models) == 1:
+        model_name = next(iter(checkpoint_models))
+    elif len(checkpoint_models) > 1:
+        raise ValueError(
+            f"--experiments-csv contains checkpoints trained with different models {sorted(checkpoint_models)};"
+            " pass --model explicitly to pick one"
         )
+    else:
+        model_name = "small-music-base"
+
+    same_dataset_by_experiment: dict[str, bool] = {}
+    for experiment in magnituder_experiments:
+        same = _same_dataset_as_training(args.dataset, experiment["checkpoint_args"])
+        same_dataset_by_experiment[experiment["name"]] = same
+        if same:
+            warnings.warn(
+                f"experiment {experiment['name']!r}: the evaluation CSV is the same dataset path stored in its"
+                " checkpoint. Results measure training-set behaviour, not held-out generalization.",
+                stacklevel=2,
+            )
 
     # `target_instrument_score` needs every dataset target resolvable against the classifier's
     # vocabulary; resolved once per distinct target, up front, so an unresolvable target fails fast
@@ -797,7 +861,7 @@ def main() -> None:
         "num_seeds": args.num_seeds,
         "first_seed": args.seed,
         "target_counts": dict(Counter(target for _, target, _, _ in dataset.rows)),
-        "same_dataset_as_training": {"magnituder": same_dataset_magnituder},
+        "same_dataset_as_training": {"magnituder": same_dataset_by_experiment},
         "device": str(device),
         "model_half": not args.no_half,
         "save_audio": args.save_audio,
@@ -810,21 +874,21 @@ def main() -> None:
             "proxy_targets": proxy_targets,
         },
         "base": {"generation": base_generation_config},
-        "magnituder": (
-            None
-            if magnituder_checkpoint is None
-            else {
-                "checkpoint": str(args.magnituder_checkpoint.resolve()),
-                "checkpoint_epoch": magnituder_checkpoint.get("epoch"),
-                "checkpoint_training_loss": magnituder_checkpoint.get("loss"),
-                "steering_mode": magnituder_checkpoint["steering_mode"],
-                "alpha_min": args.magnituder_alpha_min,
-                "alpha_max": args.magnituder_alpha_max,
-                "alpha_quantile_low": args.magnituder_alpha_quantile_low,
-                "alpha_quantile_high": args.magnituder_alpha_quantile_high,
-                "generation": magnituder_generation_config,
+        "magnituder_experiments": [
+            {
+                "name": experiment["name"],
+                "checkpoint": str(experiment["checkpoint_path"]),
+                "checkpoint_epoch": experiment["checkpoint"].get("epoch"),
+                "checkpoint_training_loss": experiment["checkpoint"].get("loss"),
+                "steering_mode": experiment["checkpoint"]["steering_mode"],
+                "alpha_min": experiment["alpha_bounds"][0],
+                "alpha_max": experiment["alpha_bounds"][1],
+                "alpha_quantile_low": experiment["alpha_bounds"][3],
+                "alpha_quantile_high": experiment["alpha_bounds"][4],
+                "generation": experiment["generation_config"],
             }
-        ),
+            for experiment in magnituder_experiments
+        ],
         "fixed_alpha": (
             None
             if not args.fixed_alpha_values
@@ -849,12 +913,12 @@ def main() -> None:
     pipe.diffusion.requires_grad_(False)
     pipe.diffusion.eval()
 
-    magnituder_predictor = None
-    if magnituder_checkpoint is not None:
-        magnituder_predictor = MagnitudePredictor(**magnituder_config).to(device)
-        magnituder_predictor.load_state_dict(magnituder_checkpoint["state_dict"], strict=True)
-        magnituder_predictor.requires_grad_(False)
-        magnituder_predictor.eval()
+    for experiment in magnituder_experiments:
+        predictor = MagnitudePredictor(**experiment["config"]).to(device)
+        predictor.load_state_dict(experiment["checkpoint"]["state_dict"], strict=True)
+        predictor.requires_grad_(False)
+        predictor.eval()
+        experiment["predictor"] = predictor
 
     clap = ClapLoss.from_pretrained(reduction="none").to(device)
     sampling_rate = pipe.sample_rate
@@ -872,7 +936,7 @@ def main() -> None:
 
     num_methods_per_sample_seed = (
         1  # base
-        + (1 if magnituder_predictor is not None else 0)
+        + len(magnituder_experiments)
         + len(fixed_alpha_methods)
         + 1  # cfg_diff
     )
@@ -896,19 +960,13 @@ def main() -> None:
             args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
         )
 
-        # 2. magnituder: skipped when no --magnituder-checkpoint was given.
-        if magnituder_predictor is not None:
+        # 2. magnituder: one method per row of --experiments-csv, skipped when it was omitted.
+        for experiment in magnituder_experiments:
             run_pipeline(
                 pipe, clap, dataset, target_embeds, classifier, canonical_targets,
-                {"magnituder": (magnituder_predictor, "cfg_diff_magnitude")},
-                magnituder_generation_config,
-                (
-                    args.magnituder_alpha_min,
-                    args.magnituder_alpha_max,
-                    0.0,  # alpha_magnitude: inert, "cfg_diff_magnitude" mode never reads state.magnitude
-                    args.magnituder_alpha_quantile_low,
-                    args.magnituder_alpha_quantile_high,
-                ),
+                {experiment["name"]: (experiment["predictor"], "cfg_diff_magnitude")},
+                experiment["generation_config"],
+                experiment["alpha_bounds"],
                 args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
             )
 
