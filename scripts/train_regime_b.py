@@ -6,14 +6,11 @@ Unlike a learned model that predicts a full per-frame `alpha_t`, this script kee
 profile (`pipelines.compute_cfg_diff_shape`) entirely deterministic and learns only its scalar gain,
 `magnitude`. `alpha_min`, `alpha_max` and the shape quantiles stay fixed, matching Regime A.
 
-The loss combines three terms (see `spec-loss-regime-b.md`):
+The loss combines two terms (see `spec-loss-regime-b.md`):
 
 * a margin hinge contrast (`losses.HingeClapLoss`) between the CLAP audio embedding and the
   steering target (maximized past `margin_target`) and retain prompt (minimized past
   `margin_retain`), rather than an unbounded contrast that always rewards steering harder;
-* a minimal-intervention penalty (`losses.minimal_intervention_penalty`) on `alpha_field` itself,
-  weighted by `lambda_reg` after a linear warmup (`lambda_reg_warmup_steps`), so the predictor
-  only pays the cost of intervening where the hinge terms still have gradient to give;
 * a fidelity loss (`losses.pingpong_fidelity_loss`) that penalizes the steered x̂0 estimate for
   drifting from the non-steered one wherever the CFG-diff shape found nothing to correct.
 
@@ -34,8 +31,7 @@ Example:
 `experiments/regime_b_sweep.csv` must contain exactly these columns: `name`,
 `steering_frac_start`, `steering_frac_end`, `alpha_min`, `alpha_max`, `quantile_low`,
 `quantile_high`, `magnitude_init`, `margin_target`, `margin_retain`, `retain_weight`,
-`lambda_reg`, `lambda_reg_warmup_steps`, `lambda_fid`, `epochs`, `lr`, `weight_decay`,
-`grad_accum_steps`, `max_grad_norm`.
+`lambda_fid`, `epochs`, `lr`, `weight_decay`, `grad_accum_steps`, `max_grad_norm`.
 """
 
 import argparse
@@ -55,7 +51,7 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
 
-from losses import ClapLoss, HingeClapLoss, linear_warmup, minimal_intervention_penalty, pingpong_fidelity_loss
+from losses import ClapLoss, HingeClapLoss, pingpong_fidelity_loss
 from pipelines import STEERING_MODE_MAGNITUDE, MagnitudePredictor, SteeringStableAudioPipeline
 from utils import PromptTargetDataset, collate_prompt_target
 
@@ -90,8 +86,6 @@ EXPERIMENT_CSV_FIELDS = [
     "margin_target",
     "margin_retain",
     "retain_weight",
-    "lambda_reg",
-    "lambda_reg_warmup_steps",
     "lambda_fid",
     "epochs",
     "lr",
@@ -110,13 +104,12 @@ EXPERIMENT_FLOAT_FIELDS = [
     "margin_target",
     "margin_retain",
     "retain_weight",
-    "lambda_reg",
     "lambda_fid",
     "lr",
     "weight_decay",
     "max_grad_norm",
 ]
-EXPERIMENT_INT_FIELDS = ["lambda_reg_warmup_steps", "epochs", "grad_accum_steps"]
+EXPERIMENT_INT_FIELDS = ["epochs", "grad_accum_steps"]
 # `evaluate.py` always runs a "base" and "cfg_diff" method and names its fixed-alpha methods
 # `fixed_alpha_*`; an experiment name colliding with one of those would silently merge results when
 # the output CSV is fed into evaluate.py later.
@@ -234,12 +227,6 @@ def parse_experiment_params(row: dict[str, str], row_number: int, num_inference_
         raise ValueError(f"{label}: margin_target has to be a cosine similarity in [-1, 1] but is {params['margin_target']}")
     if not -1.0 <= params["margin_retain"] <= 1.0:
         raise ValueError(f"{label}: margin_retain has to be a cosine similarity in [-1, 1] but is {params['margin_retain']}")
-    if params["lambda_reg"] < 0.0:
-        raise ValueError(f"{label}: lambda_reg has to be non-negative but is {params['lambda_reg']}")
-    if params["lambda_reg_warmup_steps"] < 0:
-        raise ValueError(
-            f"{label}: lambda_reg_warmup_steps has to be non-negative but is {params['lambda_reg_warmup_steps']}"
-        )
     if params["lambda_fid"] < 0.0:
         raise ValueError(f"{label}: lambda_fid has to be non-negative but is {params['lambda_fid']}")
     if not 0.0 <= params["steering_frac_start"] < params["steering_frac_end"] <= 1.0:
@@ -474,7 +461,7 @@ def plot_loss_curve(history: dict, path: Path) -> None:
         ax_loss.legend(frameon=False, fontsize=9, loc="best")
 
     for ax, title, ylabel in (
-        (ax_loss, "Training loss — l_clap + lambda_reg * l_reg + lambda_fid * l_fid", "loss"),
+        (ax_loss, "Training loss — l_clap + lambda_fid * l_fid", "loss"),
         (ax_cos, "CLAP cosine similarity, target against retain prompt", "cosine similarity"),
     ):
         ax.set_title(title, fontsize=11, loc="left", pad=10)
@@ -492,14 +479,13 @@ def plot_loss_curve(history: dict, path: Path) -> None:
 
 
 def plot_loss_terms(history: dict, path: Path) -> None:
-    r"""Writes `l_clap`, `lambda_reg * l_reg` and `lambda_fid * l_fid` separately (Task 4 logging)."""
+    r"""Writes `l_clap` and `lambda_fid * l_fid` separately (Task 4 logging)."""
     iterations = history["iterations"]
     steps = [record["step"] for record in iterations]
 
     fig, ax = plt.subplots(figsize=(9, 5), facecolor=PALETTE["surface"])
     for key, label, color in (
         ("l_clap", "l_clap", PALETTE["series"]),
-        ("weighted_l_reg", "lambda_reg * l_reg", PALETTE["series_2"]),
         ("weighted_l_fid", "lambda_fid * l_fid", PALETTE["series_3"]),
     ):
         values = [record[key] for record in iterations]
@@ -569,26 +555,21 @@ def compute_losses(
     targets: list[str],
     retains: list[str],
     hinge_loss: HingeClapLoss,
-    lambda_reg: float,
     lambda_fid: float,
 ) -> tuple[torch.Tensor, dict]:
-    r"""Shared by the training step and `run_validation`: combines the three Task 1-3 loss terms."""
+    r"""Shared by the training step and `run_validation`: combines the two Task 1/3 loss terms."""
     hinge = hinge_loss(audio_embeds, targets, retains)
-    l_reg = minimal_intervention_penalty(output.alpha_field_records)
     l_fid, l_fid_per_step = pingpong_fidelity_loss(output.alpha_field_records)
 
-    weighted_l_reg = lambda_reg * l_reg
     weighted_l_fid = lambda_fid * l_fid
-    loss = hinge["l_clap"] + weighted_l_reg + weighted_l_fid
+    loss = hinge["l_clap"] + weighted_l_fid
 
     magnitude_values = torch.cat([record["magnitude"].flatten() for record in output.alpha_field_records])
 
     metrics = {
         **hinge,
-        "l_reg": l_reg,
         "l_fid": l_fid,
         "l_fid_per_step": [float(value.detach()) for value in l_fid_per_step],
-        "weighted_l_reg": weighted_l_reg,
         "weighted_l_fid": weighted_l_fid,
         "magnitude_min": float(magnitude_values.min()),
         "magnitude_mean": float(magnitude_values.mean()),
@@ -647,9 +628,7 @@ def run_validation(
         )
         audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
 
-        loss, metrics = compute_losses(
-            output, audio_embeds, targets, retains, hinge_loss, args.lambda_reg, args.lambda_fid
-        )
+        loss, metrics = compute_losses(output, audio_embeds, targets, retains, hinge_loss, args.lambda_fid)
 
         batch_size = len(prompts)
         total_samples += batch_size
@@ -777,9 +756,8 @@ def run_experiment(
             )
             audio_embeds = clap_loss.encode_audio(waveform.mean(dim=1), pipe.sample_rate)
 
-            lambda_reg_t = linear_warmup(step, combined_args.lambda_reg, combined_args.lambda_reg_warmup_steps)
             loss, metrics = compute_losses(
-                output, audio_embeds, targets, retains, hinge_loss, lambda_reg_t, combined_args.lambda_fid
+                output, audio_embeds, targets, retains, hinge_loss, combined_args.lambda_fid
             )
 
             (loss / combined_args.grad_accum_steps).backward()
@@ -807,12 +785,9 @@ def run_experiment(
                     "l_clap": float(metrics["l_clap"].detach()),
                     "l_target": float(metrics["l_target"].detach()),
                     "l_retain": float(metrics["l_retain"].detach()),
-                    "l_reg": float(metrics["l_reg"].detach()),
                     "l_fid": float(metrics["l_fid"].detach()),
                     "l_fid_per_step": metrics["l_fid_per_step"],
-                    "weighted_l_reg": float(metrics["weighted_l_reg"].detach()),
                     "weighted_l_fid": float(metrics["weighted_l_fid"].detach()),
-                    "lambda_reg": lambda_reg_t,
                     "target_satisfied_frac": metrics["target_satisfied_frac"],
                     "retain_satisfied_frac": metrics["retain_satisfied_frac"],
                     "both_satisfied_frac": metrics["both_satisfied_frac"],
@@ -824,7 +799,7 @@ def run_experiment(
             )
             print(
                 f"[{combined_args.name}] epoch {epoch}/{combined_args.epochs} batch {batch_index + 1}/{len(dataloader)}"
-                f" loss {loss_value:+.4f} s_t {s_t:+.4f} s_r {s_r:+.4f} lambda_reg {lambda_reg_t:.4g}"
+                f" loss {loss_value:+.4f} s_t {s_t:+.4f} s_r {s_r:+.4f}"
                 f" magnitude[min/mean/max] {metrics['magnitude_min']:.3f}/{metrics['magnitude_mean']:.3f}/"
                 f"{metrics['magnitude_max']:.3f} both_satisfied {metrics['both_satisfied_frac']:.2f}"
                 f" grad_norm {'-' if grad_norm is None else f'{grad_norm:.3e}'}",
