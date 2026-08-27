@@ -17,3 +17,6 @@ datasets/
 
 # Training artifacts
 outputs/
+
+# Training CSV experiments
+experiments/
