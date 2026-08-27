@@ -671,10 +671,16 @@ def run_experiment(
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "args.json").write_text(json.dumps(vars(combined_args), indent=2, default=str), encoding="utf-8")
 
-    _, example_target, example_retain, _ = dataloader.dataset.rows[0]
+    distinct_targets = sorted({row[1] for row in dataloader.dataset.rows})
+    _, _, example_retain, _ = dataloader.dataset.rows[0]
+    target_label = (
+        repr(distinct_targets[0])
+        if len(distinct_targets) == 1
+        else f"{len(distinct_targets)} distinct targets {distinct_targets}"
+    )
     print(
         f"[{combined_args.name}] Retain weight {combined_args.retain_weight}, margin_target {combined_args.margin_target},"
-        f" margin_retain {combined_args.margin_retain}, target {example_target!r}, example retain prompt:"
+        f" margin_retain {combined_args.margin_retain}, target(s) {target_label}, example retain prompt:"
         f" {example_retain!r}"
     )
 

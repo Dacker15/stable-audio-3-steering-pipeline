@@ -67,6 +67,7 @@ RESULT_FIELDS = [
     "method",
     "prompt",
     "target",
+    "target_instrument",
     "retain_prompt",
     "target_similarity",
     "target_instrument_score",
@@ -501,10 +502,18 @@ def summarize(
         target = _mean_ci_by_prompt(method_rows, lambda row: row["target_similarity"], bootstrap_samples, rng)
         prompt = _mean_ci_by_prompt(method_rows, lambda row: row["prompt_similarity"], bootstrap_samples, rng)
         retain = _mean_ci_by_prompt(method_rows, lambda row: row["retain_similarity"], bootstrap_samples, rng)
+
+        instrument_scores: dict[str, list[float]] = defaultdict(list)
+        for row in method_rows:
+            instrument_scores[row["target_instrument"]].append(row["target_instrument_score"])
+
         method_summary = {
             "num_generations": len(method_rows),
             "target_similarity": target,
             "target_instrument_score": float(np.mean([row["target_instrument_score"] for row in method_rows])),
+            "target_instrument_score_by_target": {
+                instrument: float(np.mean(scores)) for instrument, scores in sorted(instrument_scores.items())
+            },
             "prompt_similarity": prompt,
             "retain_similarity": retain,
             "rms_mean": float(np.mean([row["rms"] for row in method_rows])),
@@ -729,6 +738,7 @@ def run_pipeline(
                     "method": method_name,
                     "prompt": prompt,
                     "target": target,
+                    "target_instrument": canonical_targets[target],
                     "retain_prompt": retain_prompt,
                     "target_similarity": target_similarity,
                     "target_instrument_score": target_instrument_score,

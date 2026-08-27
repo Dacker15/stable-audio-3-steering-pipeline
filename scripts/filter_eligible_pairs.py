@@ -12,11 +12,22 @@ Example:
     uv run python scripts/filter_eligible_pairs.py \
         --input datasets/eligible_pairs_test.csv \
         --output datasets/eligible_pairs_test_filtered.csv
+
+Pass `--split TRAIN VALIDATION TEST` (proportions summing to 1.0) to additionally shuffle the
+filtered rows with `--split-seed` and write three CSVs (`*_train.csv`, `*_validation.csv`,
+`*_test.csv`) instead of a single one:
+
+    uv run python scripts/filter_eligible_pairs.py \
+        --input datasets/eligible_pairs_test.csv \
+        --output datasets/eligible_pairs_test_filtered.csv \
+        --split 0.8 0.1 0.1
 """
 
 import argparse
 import csv
 import json
+import math
+import random
 from pathlib import Path
 
 REQUIRED_INPUT_COLUMNS = (
@@ -45,9 +56,28 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="minimum mean instrument_scores over requested_instruments for a row to be kept",
     )
+    parser.add_argument(
+        "--split",
+        type=float,
+        nargs=3,
+        metavar=("TRAIN", "VALIDATION", "TEST"),
+        default=None,
+        help="train/validation/test proportions (must sum to 1.0); if omitted, writes a single CSV to --output",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="seed for shuffling accepted rows before splitting; only used with --split",
+    )
     args = parser.parse_args()
     if not 0.0 <= args.min_score <= 1.0:
         parser.error("--min-score must be in [0.0, 1.0]")
+    if args.split is not None:
+        if any(frac < 0.0 for frac in args.split):
+            parser.error("--split proportions must be non-negative")
+        if not math.isclose(sum(args.split), 1.0, abs_tol=1e-6):
+            parser.error(f"--split proportions must sum to 1.0, got {sum(args.split)}")
     return args
 
 
@@ -78,6 +108,41 @@ def row_is_eligible(row: dict, min_score: float, line_number: int) -> tuple[bool
     return True, None
 
 
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=OUTPUT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _split_output_path(output: Path, split_name: str) -> Path:
+    return output.with_name(f"{output.stem}_{split_name}{output.suffix}")
+
+
+def _split_rows(rows: list[dict], proportions: list[float], seed: int) -> dict[str, list[dict]]:
+    """Shuffles `rows` with `seed`, then splits into train/validation/test using the largest-remainder
+    method so the three counts always sum exactly to `len(rows)`."""
+
+    shuffled = rows.copy()
+    random.Random(seed).shuffle(shuffled)
+
+    total = len(shuffled)
+    raw_counts = [frac * total for frac in proportions]
+    counts = [int(count) for count in raw_counts]  # floor
+    remainder = total - sum(counts)
+
+    order = sorted(range(3), key=lambda i: raw_counts[i] - counts[i], reverse=True)
+    for i in order[:remainder]:
+        counts[i] += 1
+
+    train_count, val_count, _ = counts
+    return {
+        "train": shuffled[:train_count],
+        "validation": shuffled[train_count : train_count + val_count],
+        "test": shuffled[train_count + val_count :],
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -91,33 +156,39 @@ def main() -> None:
             )
 
         total = 0
-        accepted = 0
+        accepted_rows: list[dict] = []
         rejection_counts: dict[str, int] = {}
 
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("w", newline="", encoding="utf-8") as output_file:
-            writer = csv.DictWriter(output_file, fieldnames=OUTPUT_FIELDS)
-            writer.writeheader()
+        for row in reader:
+            total += 1
+            eligible, reason = row_is_eligible(row, args.min_score, reader.line_num)
+            if not eligible:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
 
-            for row in reader:
-                total += 1
-                eligible, reason = row_is_eligible(row, args.min_score, reader.line_num)
-                if not eligible:
-                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                    continue
+            accepted_rows.append(
+                {
+                    "prompt": row["prompt"],
+                    "target": row["target"],
+                    "seed": int(row["seed_index"]) + int(row["seed"]),
+                    "retain_prompt": row["retain_prompt"],
+                }
+            )
 
-                accepted += 1
-                writer.writerow(
-                    {
-                        "prompt": row["prompt"],
-                        "target": row["target"],
-                        "seed": int(row["seed_index"]) + int(row["seed"]),
-                        "retain_prompt": row["retain_prompt"],
-                    }
-                )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Read {total} rows from {args.input}")
-    print(f"Kept {accepted} rows -> {args.output}")
+    if args.split is None:
+        _write_csv(args.output, accepted_rows)
+        print(f"Kept {len(accepted_rows)} rows -> {args.output}")
+    else:
+        splits = _split_rows(accepted_rows, args.split, args.split_seed)
+        print(f"Kept {len(accepted_rows)} rows, split with seed {args.split_seed}:")
+        for name in ("train", "validation", "test"):
+            path = _split_output_path(args.output, name)
+            _write_csv(path, splits[name])
+            print(f"  {name}: {len(splits[name])} rows -> {path}")
+
     if rejection_counts:
         print("Rejected rows by reason:")
         for reason, count in sorted(rejection_counts.items(), key=lambda item: -item[1]):
