@@ -7,10 +7,11 @@ from torch import nn
 
 class MagnitudePredictor(nn.Module):
     r"""
-    Predicts a single scalar `magnitude` in `[0, 1]` per sample, Regime B's one learned degree of
-    freedom for `SteeringStableAudioPipeline`'s `"cfg_diff_magnitude"` mode:
+    Predicts a single scalar `magnitude` in `[0, 1]` per sample, the one learned degree of freedom in
+    `SteeringStableAudioPipeline`'s `"cfg_diff_magnitude"` mode:
     `alpha_field = alpha_min + (alpha_max - alpha_min) * magnitude * shape`, where `shape` stays
-    entirely deterministic (`pipelines.compute_cfg_diff_shape`, Regime A's CFG-diff profile).
+    entirely deterministic (`pipelines.compute_cfg_diff_shape`, the same profile `"cfg_diff"` mode
+    uses with a fixed `magnitude`).
 
     Unlike a learned model that predicts a full per-frame `alpha_t` and therefore reads the latents'
     spatial structure with a convolutional encoder, this only has to produce one number per sample:

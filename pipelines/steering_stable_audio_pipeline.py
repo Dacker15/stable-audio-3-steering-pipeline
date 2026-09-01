@@ -6,10 +6,10 @@ classifier free guidance lives one level deeper, inside the model itself:
 `stable_audio_3.models.dit.DiffusionTransformer.forward` builds the `[conditional, unconditional]`
 batch, converts both predictions into denoised space, combines them and converts the result back.
 The sampler never sees the two branches. Steering therefore overrides *that* component,
-`SteeringDiffusionTransformer`, and `SteeringStableAudioPipeline` reimplements just enough of
-`StableAudioModel.generate` and `sample_diffusion` to drive it, mainly because both of those are
-decorated with `torch.inference_mode()` / `torch.no_grad()` and would detach the trajectory the
-predictor is trained through.
+`SteeringDiffusionTransformer`, and `SteeringStableAudioPipeline` reimplements the parts of
+`StableAudioModel.generate` and `sample_diffusion` needed to drive it: both are decorated with
+`torch.inference_mode()` / `torch.no_grad()`, which would detach the trajectory the predictor is
+trained through.
 """
 
 import math
@@ -91,12 +91,12 @@ class SteeringState:
     train: bool = False
     step: int | None = None
     records: list[tuple[int, float]] = field(default_factory=list)
-    # Regime A (`mode="cfg_diff"`): deterministic, per-frame `alpha_t` from the CFG-diff norm,
-    # computed by `compute_cfg_diff_alpha` instead of calling `steering_model`, sharing `alpha_min`/
-    # `alpha_max` with `"learned"` mode's own bounds for compatibility between the two modes.
-    # Regime B (`mode="cfg_diff_magnitude"`): same deterministic `shape`, but `magnitude` is a
-    # learned per-sample scalar from `steering_model` (a `MagnitudePredictor`) instead of the fixed
-    # `magnitude` float below.
+    # `mode="cfg_diff"`: deterministic, per-frame `alpha_t` from the CFG-diff norm, computed by
+    # `compute_cfg_diff_alpha` instead of calling `steering_model`, sharing `alpha_min`/`alpha_max`
+    # with `"learned"` mode's own bounds for compatibility between modes. `magnitude` is the fixed
+    # float below.
+    # `mode="cfg_diff_magnitude"`: same deterministic `shape`, but `magnitude` is a learned
+    # per-sample scalar from `steering_model` (a `MagnitudePredictor`) instead of the fixed float.
     mode: Literal["learned", "cfg_diff", "cfg_diff_magnitude"] = "learned"
     alpha_min: float = 0.0
     alpha_max: float = 1.0
@@ -232,8 +232,8 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
 
     def _predict_magnitude(self, state: SteeringState, latents: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         r"""
-        Returns `magnitude` of shape `(batch_size, 1, 1)`, Regime B's learned gain on the
-        deterministic CFG-diff `shape` profile.
+        Returns `magnitude` of shape `(batch_size, 1, 1)`, the learned gain on the deterministic
+        CFG-diff `shape` profile.
 
         Same checkpointing rationale as `_predict_alpha`, but `MagnitudePredictor` reads the latents
         directly (no convolutional encoder, so no singleton height axis to add).
@@ -438,8 +438,8 @@ class SteeringDiffusionTransformer(DiffusionTransformer):
 
         if state.mode == "cfg_diff_magnitude":
             # collected whether or not `state.train`, so validation (which calls with `train=False`)
-            # can still compute Regime B's `l_reg`/`l_fid`/diagnostics; graph-connected for
-            # `alpha_field`/`steered_xhat0` only when there is a graph to connect to, i.e. training
+            # can still compute `l_reg`/`l_fid`/diagnostics; graph-connected for `alpha_field`/
+            # `steered_xhat0` only when there is a graph to connect to, i.e. training
             state.alpha_field_records.append(
                 {
                     "step": state.step,
@@ -671,7 +671,7 @@ class SteeringStableAudioPipeline:
                 as before. `"cfg_diff"` derives a deterministic, per-frame `alpha_t` from the norm of
                 the CFG-diff between the full-prompt and retain-prompt guidance
                 (`pipelines.compute_cfg_diff_alpha`), at zero training cost. `"cfg_diff_magnitude"`
-                (Regime B) keeps that same deterministic per-frame `shape`
+                keeps that same deterministic per-frame `shape`
                 (`pipelines.compute_cfg_diff_shape`) but replaces the fixed `alpha_magnitude` gain
                 with a single learned scalar per sample from `steering_model`. Either way the
                 steering window and CFG algebra are identical; only the source of `alpha_t` differs.

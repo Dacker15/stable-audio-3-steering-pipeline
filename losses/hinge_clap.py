@@ -12,14 +12,15 @@ class HingeClapLoss(nn.Module):
     Ordinary `ClapLoss` used as `loss = -target_distance + retain_weight * retain_distance` has no
     saturation point: it always rewards moving the target similarity down and the retain similarity
     up, however far either already is. That is enough for a policy with a single fixed degree of
-    freedom (Regime A's constant `magnitude`), but a learned one (Regime B) collapses towards
-    "steer at maximum strength always" instead of learning when to hold back. Replacing the two
+    freedom (a constant `magnitude`), but one where `magnitude` is learned per sample collapses
+    towards "steer at maximum strength always" instead of learning when to hold back. Replacing the
+    two
     linear terms with hinges gives each one a point past which it stops contributing gradient:
     `l_target` once the target similarity has dropped below `margin_target`, `l_retain` once the
     retain similarity has risen above `margin_retain`.
 
-    `margin_target`/`margin_retain` have no principled default: they should be picked by listening to
-    a batch of Regime A generations and reading off the `s_t`/`s_r` this loss also reports, at the
+    `margin_target`/`margin_retain` have no principled default: they are set by listening to a batch
+    of fixed-`magnitude` generations and reading off the `s_t`/`s_r` this loss also reports, at the
     similarity level judged "good enough". `outputs/07_cfg_diff_evaluation/results.csv`'s
     `target_similarity`/`retain_similarity` columns (method `cfg_diff`) are a starting sample.
 

@@ -41,7 +41,7 @@ def strip_target(prompt: str, target: str) -> str:
 
     stripped = re.sub(pattern, "", prompt, flags=re.IGNORECASE)
 
-    # clean up the debris the removal leaves: doubled spaces, punctuation that lost the word it
+    # normalize what the removal leaves behind: doubled spaces, punctuation that lost the word it
     # followed, and the separators of an enumeration that lost one of its items
     stripped = re.sub(r"\s+", " ", stripped)
     stripped = re.sub(r"\s+([,.;:!?])", r"\1", stripped)

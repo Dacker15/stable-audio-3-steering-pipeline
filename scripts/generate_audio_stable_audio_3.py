@@ -9,12 +9,12 @@ sample, so with `--batch-size 1` (the default) every clip gets its own reproduci
 larger batch the whole batch shares the seed written on each of its manifest rows.
 
 Example, prompts given directly on the command line:
-    uv run python scripts/generate_audio_stable_audio_3.py \
+    uv run scripts/generate_audio_stable_audio_3.py \
         --prompt "A laid-back jazz trumpet solo over walking bass" \
         --output outputs/generated --steps 50
 
 Example, prompts read from a CSV file with a `prompt` column:
-    uv run python scripts/generate_audio_stable_audio_3.py --dataset datasets/stable_audio_prompts.csv \
+    uv run scripts/generate_audio_stable_audio_3.py --dataset datasets/stable_audio_prompts.csv \
         --output outputs/generated --model small-music
 """
 

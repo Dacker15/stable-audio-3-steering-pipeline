@@ -3,7 +3,7 @@ Evaluates steering methods against the unsteered Stable Audio 3 baseline.
 
 The evaluator runs an always-on ``base`` reference (constant ``alpha=0``, i.e. plain full-prompt
 CFG), one ``magnituder`` method per row of ``--experiments-csv`` (the CSV written by
-``scripts/train_regime_b.py``, each row a ``MagnitudePredictor`` checkpoint named after its
+``scripts/train.py``, each row a ``MagnitudePredictor`` checkpoint named after its
 ``name`` column), the ``fixed-alpha`` pipeline (constant-alpha controls) and the ``cfg-diff``
 pipeline (deterministic, training-free). Each magnituder experiment's steering bounds and
 generation settings are read from its own checkpoint's stored training args, not from CLI flags,
@@ -11,24 +11,24 @@ since a sweep's rows can use different steering windows; ``fixed-alpha`` and ``c
 configured exclusively from their own prefixed CLI parameters, so passing e.g.
 ``--cfg-diff-cfg-scale`` never affects the other pipelines' generation settings and vice versa.
 
-Example smoke test (using the CSV produced by ``scripts/train_regime_b.py``):
+Example smoke test (using the CSV produced by ``scripts/train.py``):
 
-    uv run python scripts/evaluate.py \
+    uv run scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/validation.csv \
-        --experiments-csv outputs/trumpet-regime-b/experiments.csv \
+        --experiments-csv outputs/trumpet-learned/experiments.csv \
         --output outputs/eval-smoke --max-samples 4 --num-seeds 1
 
 Example final run with fixed-alpha controls:
 
-    uv run python scripts/evaluate.py \
+    uv run scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
-        --experiments-csv outputs/trumpet-regime-b/experiments.csv \
+        --experiments-csv outputs/trumpet-learned/experiments.csv \
         --output outputs/eval-final --num-seeds 5 \
         --fixed-alpha-values 0.25 0.5 0.75 1.0
 
 Example cfg-diff-only run (no trained checkpoint required):
 
-    uv run python scripts/evaluate.py \
+    uv run scripts/evaluate.py \
         --dataset datasets/trumpet_simple_splits/test.csv \
         --output outputs/eval-cfg-diff-only --num-seeds 3 --fixed-alpha-values
 
@@ -103,7 +103,7 @@ GENERATION_DEFAULTS: dict[str, float | int] = {
 INERT_ALPHA_BOUNDS = (0.0, 1.0, 0.0, 0.10, 0.90)
 
 # Fallback steering bounds for a magnituder experiment whose checkpoint predates a given key; matches
-# what `scripts/train_regime_b.py`'s steering argument group used to default to.
+# what `scripts/train.py`'s steering argument group used to default to.
 MAGNITUDER_ALPHA_DEFAULTS: dict[str, float] = {
     "alpha_min": 0.0,
     "alpha_max": 5.0,
@@ -228,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     cfg_diff = parser.add_argument_group(
         "cfg-diff pipeline",
         description=(
-            "Regime A: a zero-cost, training-free 'cfg_diff' method, always evaluated, deriving a deterministic"
+            "A zero-cost, training-free 'cfg_diff' method, always evaluated, deriving a deterministic"
             " per-frame alpha_t from the CFG-diff norm instead of calling a steering model."
         ),
     )
@@ -255,8 +255,8 @@ def parse_args() -> argparse.Namespace:
         "magnituder pipeline",
         description=(
             "One 'magnituder' method per row of --experiments-csv (the CSV written by"
-            " scripts/train_regime_b.py), each a MagnitudePredictor checkpoint predicting a single"
-            " per-sample magnitude that scales Regime A's deterministic CFG-diff shape into alpha_t. Steering"
+            " scripts/train.py), each a MagnitudePredictor checkpoint predicting a single"
+            " per-sample magnitude that scales the deterministic CFG-diff shape into alpha_t. Steering"
             " bounds and generation settings come from each checkpoint's own stored training args, not CLI"
             " flags, since a sweep's rows can use different steering windows. Skipped entirely when"
             " --experiments-csv is omitted."
@@ -267,7 +267,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "CSV written by scripts/train_regime_b.py, needs 'name' and 'best_model_path' columns; rows whose"
+            "CSV written by scripts/train.py, needs 'name' and 'best_model_path' columns; rows whose"
             " best_model_path starts with 'FAILED:' are skipped; omit to skip the magnituder pipeline"
         ),
     )
@@ -358,7 +358,7 @@ def resolve_checkpoint_alpha_bounds(checkpoint_args: dict) -> tuple[float, float
 
 
 def read_magnituder_experiments(path: Path) -> list[dict[str, str]]:
-    """Reads the CSV written by `scripts/train_regime_b.py`, returning `{"name", "best_model_path"}`
+    """Reads the CSV written by `scripts/train.py`, returning `{"name", "best_model_path"}`
     dicts for the training experiments that succeeded — rows whose `best_model_path` starts with
     `"FAILED:"` are training runs that raised, and are skipped with a printed notice."""
 
@@ -369,7 +369,7 @@ def read_magnituder_experiments(path: Path) -> list[dict[str, str]]:
         if missing:
             raise ValueError(
                 f"{path} is missing required column(s) {missing}; it must be the CSV written by"
-                " scripts/train_regime_b.py"
+                " scripts/train.py"
             )
         rows = list(reader)
     if not rows:
@@ -785,12 +785,14 @@ def main() -> None:
             if missing:
                 raise ValueError(f"checkpoint {checkpoint_path} is missing keys {sorted(missing)}")
             if "steering_mode" not in checkpoint:
-                raise ValueError(f"checkpoint {checkpoint_path} predates Regime B and cannot be evaluated")
+                raise ValueError(
+                    f"checkpoint {checkpoint_path} predates the steering_mode field and cannot be evaluated"
+                )
             if checkpoint["steering_mode"] != STEERING_MODE_MAGNITUDE:
                 raise ValueError(
                     f"checkpoint {checkpoint_path} uses steering mode {checkpoint['steering_mode']!r}, but"
                     f" --experiments-csv requires {STEERING_MODE_MAGNITUDE!r} (MagnitudePredictor checkpoints"
-                    " produced by scripts/train_regime_b.py)."
+                    " produced by scripts/train.py)."
                 )
             checkpoint_args = checkpoint.get("args", {})
             magnituder_experiments.append(

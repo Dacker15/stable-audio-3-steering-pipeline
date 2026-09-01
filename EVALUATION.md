@@ -9,7 +9,8 @@ Every prompt/seed pair is generated with identical initial noise under:
 - `base`: constant `alpha=0`, exactly preserving full-prompt CFG. Always evaluated, and independent
   of the pipelines below — it's the reference point every other method is compared against;
 - `magnituder`: the `MagnitudePredictor` loaded from `--magnituder-checkpoint`, a learned per-sample
-  gain on Regime A's deterministic CFG-diff shape. Skipped when `--magnituder-checkpoint` is omitted;
+  gain on the deterministic CFG-diff shape (in contrast to `cfg_diff`'s fixed `magnitude`
+  hyperparameter). Skipped when `--magnituder-checkpoint` is omitted;
 - optional fixed-alpha controls supplied through `--fixed-alpha-values`;
 - `cfg_diff`: a zero-cost, training-free method, always evaluated.
 
@@ -21,11 +22,11 @@ Evaluation runs with batch size one because the current pipeline records alpha a
 
 ## Before running
 
-To evaluate the `magnituder` method, first produce a checkpoint with `scripts/train_regime_b.py`,
+To evaluate the `magnituder` method, first produce a checkpoint with `scripts/train.py`,
 for example:
 
 ```powershell
-uv run python scripts/train_regime_b.py `
+uv run scripts/train_regime_b.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
   --output outputs/trumpet-regime-b `
   --epochs 5 --margin-target 0.30 --margin-retain 0.40 `
@@ -37,7 +38,7 @@ uv run python scripts/train_regime_b.py `
 Create the group-aware splits first with:
 
 ```powershell
-uv run python scripts/create_simple_splits.py `
+uv run scripts/create_simple_splits.py `
   --input datasets/trumpet_prompts_simple_dataset.csv `
   --output-dir datasets/trumpet_simple_splits `
   --seed 42
@@ -46,7 +47,7 @@ uv run python scripts/create_simple_splits.py `
 The split contains 132/44/44 train/validation/test rows. The two templates that share a genre and
 accompaniment are assigned together, preventing their near-duplicate pair from leaking across splits.
 
-For reportable results, evaluate a held-out CSV that was not passed to `train_regime_b.py`. The
+For reportable results, evaluate a held-out CSV that was not passed to `train.py`. The
 evaluator checks the evaluation path against the dataset path stored in the checkpoint and writes a
 leakage warning when they match. Evaluating the training CSV remains useful as a diagnostic or smoke
 test, but does not measure generalization.
@@ -67,7 +68,7 @@ This checks the end-to-end evaluator with a small workload. Eight denoising step
 for checking that the machinery works; they are not comparable to a full 50-step evaluation.
 
 ```powershell
-uv run python scripts/evaluate.py `
+uv run scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
   --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
   --output outputs/eval-smoke `
@@ -82,7 +83,7 @@ Use multiple seeds and include fixed-alpha controls to test whether the learned 
 over a constant intervention:
 
 ```powershell
-uv run python scripts/evaluate.py `
+uv run scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/test.csv `
   --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
   --output outputs/eval-final `
@@ -128,7 +129,7 @@ For each generated waveform the evaluator records:
 - `target_similarity`: CLAP cosine similarity between audio and target; lower is better;
 - `retain_similarity`: CLAP cosine similarity between audio and the explicit retain prompt, or the
   fallback produced by `utils.strip_target` for legacy datasets; higher is better, and this is the
-  term `scripts/train_regime_b.py` optimizes alongside suppression;
+  term `scripts/train.py` optimizes alongside suppression;
 - `prompt_similarity`: CLAP cosine similarity between audio and the full prompt;
 - RMS, peak, near-silence ratio and clipping ratio;
 - alpha mean, standard deviation, minimum and maximum;

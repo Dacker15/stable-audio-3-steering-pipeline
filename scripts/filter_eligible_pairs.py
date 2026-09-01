@@ -9,7 +9,7 @@ A row is kept only if:
 
 Example:
 
-    uv run python scripts/filter_eligible_pairs.py \
+    uv run scripts/filter_eligible_pairs.py \
         --input datasets/eligible_pairs_test.csv \
         --output datasets/eligible_pairs_test_filtered.csv
 
@@ -17,7 +17,7 @@ Pass `--split TRAIN VALIDATION TEST` (proportions summing to 1.0) to additionall
 filtered rows with `--split-seed` and write three CSVs (`*_train.csv`, `*_validation.csv`,
 `*_test.csv`) instead of a single one:
 
-    uv run python scripts/filter_eligible_pairs.py \
+    uv run scripts/filter_eligible_pairs.py \
         --input datasets/eligible_pairs_test.csv \
         --output datasets/eligible_pairs_test_filtered.csv \
         --split 0.8 0.1 0.1

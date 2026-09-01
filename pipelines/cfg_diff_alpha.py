@@ -12,10 +12,11 @@ def compute_cfg_diff_shape(
     Deterministic, per-frame temporal profile of the CFG-diff (full vs retain), robustly normalized
     to `[0, 1]` per sample.
 
-    This is the "shape" half of Regime A/B's `alpha_t = (alpha_min + (alpha_max - alpha_min) *
-    magnitude * shape)`: how strongly the target-removal changes the prediction, per frame, relative
-    to that sample's own range. `magnitude` is the other half, either a fixed hyperparameter
-    (`compute_cfg_diff_alpha`, Regime A) or a learned per-sample scalar (Regime B).
+    This is the "shape" half of `alpha_t = (alpha_min + (alpha_max - alpha_min) * magnitude *
+    shape)`, shared by both `"cfg_diff"` and `"cfg_diff_magnitude"` steering modes: how strongly the
+    target-removal changes the prediction, per frame, relative to that sample's own range. `magnitude`
+    is the other half, either a fixed hyperparameter (`compute_cfg_diff_alpha`) or a learned
+    per-sample scalar (`MagnitudePredictor`).
 
     Args:
         full_cfg, retain_cfg (`torch.Tensor`): Guided predictions, shape `(batch_size, channels,
@@ -54,8 +55,8 @@ def compute_cfg_diff_alpha(
     r"""
     Deterministic, per-frame `alpha_t`, derived from the norm of the CFG-diff (full vs retain).
 
-    This is "Regime A": a zero-cost, training-free alternative to a learned per-frame steering
-    model for `SteeringStableAudioPipeline`. Where a learned model predicts `alpha_t` from the
+    A zero-cost, training-free alternative to a learned per-frame steering model for
+    `SteeringStableAudioPipeline`. Where a learned model predicts `alpha_t` from the
     latents, this reads it directly off the signal `SteeringDiffusionTransformer` already computes
     at every steered step, the difference between the full-prompt and retain-prompt classifier-free
     guidance predictions.
@@ -64,8 +65,8 @@ def compute_cfg_diff_alpha(
         full_cfg, retain_cfg (`torch.Tensor`): Guided predictions, shape `(batch_size, channels,
             frames)`.
         alpha_min, alpha_max (`float`): Same bounds `"learned"` mode uses, for compatibility.
-        magnitude (`float`): Global gain in `[0, 1]`, a fixed hyperparameter rather than a learned
-            one in this regime.
+        magnitude (`float`): Global gain in `[0, 1]`, a fixed hyperparameter rather than a value
+            predicted per sample.
         quantile_low, quantile_high (`float`, *optional*): Percentiles used for the robust
             per-sample normalization of the temporal profile, computed along the frame axis.
         eps (`float`, *optional*): Numerical stabilization for the quantile normalization.

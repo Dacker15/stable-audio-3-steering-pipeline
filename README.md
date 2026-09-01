@@ -18,7 +18,7 @@ Place `trumpet_prompts_simple_dataset.csv` in `datasets/`, then create determini
 splits. Each pair of equivalent prompt templates stays in the same split.
 
 ```powershell
-uv run python scripts/create_simple_splits.py `
+uv run scripts/create_simple_splits.py `
   --input datasets/trumpet_prompts_simple_dataset.csv `
   --output-dir datasets/trumpet_simple_splits `
   --seed 42
@@ -28,11 +28,12 @@ This creates 132 training rows, 44 validation rows and 44 test rows.
 
 ## Train
 
-`scripts/train_regime_b.py` trains a `MagnitudePredictor`: a learned per-sample gain on Regime A's
-deterministic CFG-diff shape ("Regime B", `steering_mode="cfg_diff_magnitude"`).
+`scripts/train.py` trains a `MagnitudePredictor`: a learned per-sample gain on the
+deterministic CFG-diff shape (`steering_mode="cfg_diff_magnitude"`), in contrast to the fixed
+`magnitude` hyperparameter `steering_mode="cfg_diff"` uses.
 
 ```powershell
-uv run python scripts/train_regime_b.py `
+uv run scripts/train_regime_b.py `
   --dataset datasets/trumpet_simple_splits/train.csv `
   --output outputs/trumpet-regime-b `
   --epochs 5 --margin-target 0.30 --margin-retain 0.40 `
@@ -46,7 +47,7 @@ training-free `cfg-diff` method that needs no checkpoint at all.
 ## Evaluate
 
 ```powershell
-uv run python scripts/evaluate.py `
+uv run scripts/evaluate.py `
   --dataset datasets/trumpet_simple_splits/validation.csv `
   --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
   --output outputs/trumpet-regime-b-validation

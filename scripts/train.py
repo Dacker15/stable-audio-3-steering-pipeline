@@ -1,12 +1,13 @@
 r"""
 Trains a `MagnitudePredictor` to steer `SteeringStableAudioPipeline` with a learned, per-sample gain
-on Regime A's deterministic CFG-diff shape ("Regime B", `steering_mode="cfg_diff_magnitude"`).
+on the deterministic CFG-diff shape (`steering_mode="cfg_diff_magnitude"`).
 
 Unlike a learned model that predicts a full per-frame `alpha_t`, this script keeps the temporal
 profile (`pipelines.compute_cfg_diff_shape`) entirely deterministic and learns only its scalar gain,
-`magnitude`. `alpha_min`, `alpha_max` and the shape quantiles stay fixed, matching Regime A.
+`magnitude`. `alpha_min`, `alpha_max` and the shape quantiles stay fixed, matching the deterministic
+`"cfg_diff"` mode, which uses a fixed `magnitude` hyperparameter instead of a learned one.
 
-The loss combines two terms (see `spec-loss-regime-b.md`):
+The loss combines two terms:
 
 * a margin hinge contrast (`losses.HingeClapLoss`) between the CLAP audio embedding and the
   steering target (maximized past `margin_target`) and retain prompt (minimized past
@@ -20,15 +21,15 @@ per experiment, rather than from individual CLI flags: this script trains every 
 with a `best_model_path` column, repo-root-relative, pointing at each experiment's best checkpoint
 (or `FAILED: <error>` if that experiment's training run raised — the sweep continues past a failed
 row). `outputs/07_cfg_diff_evaluation/results.csv`'s `target_similarity`/`retain_similarity` columns
-(method `cfg_diff`) are Regime A output on a fixed `magnitude`, a starting sample for picking margins
+(method `cfg_diff`) are output from the fixed-`magnitude` mode, a starting sample for picking margins
 by listening to a batch of generations at different similarity levels.
 
 Example:
-    uv run python scripts/train_regime_b.py --dataset datasets/trumpet_simple_splits/train.csv \
+    uv run scripts/train.py --dataset datasets/trumpet_simple_splits/train.csv \
         --validation-dataset datasets/trumpet_simple_splits/val.csv --batch-size 2 \
-        --output outputs/trumpet-regime-b --experiments-csv experiments/regime_b_sweep.csv
+        --output outputs/trumpet-learned --experiments-csv experiments/learned_sweep.csv
 
-`experiments/regime_b_sweep.csv` must contain exactly these columns: `name`,
+`experiments/learned_sweep.csv_sweep.csv` must contain exactly these columns: `name`,
 `steering_frac_start`, `steering_frac_end`, `alpha_min`, `alpha_max`, `quantile_low`,
 `quantile_high`, `magnitude_init`, `margin_target`, `margin_retain`, `retain_weight`,
 `lambda_fid`, `epochs`, `lr`, `weight_decay`, `grad_accum_steps`, `max_grad_norm`.
@@ -256,8 +257,8 @@ def parse_experiment_params(row: dict[str, str], row_number: int, num_inference_
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train a batch of MagnitudePredictor experiments for Regime B (cfg_diff_magnitude): a learned"
-            " per-sample gain on Regime A's deterministic CFG-diff shape, one experiment per row of"
+            "Train a batch of MagnitudePredictor experiments (steering_mode=cfg_diff_magnitude): a learned"
+            " per-sample gain on the deterministic CFG-diff shape, one experiment per row of"
             " --experiments-csv."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
