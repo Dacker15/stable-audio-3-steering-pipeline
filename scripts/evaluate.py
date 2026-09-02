@@ -58,7 +58,13 @@ from pipelines import (
     FixedAlphaSteering,
 )
 from utils import PromptTargetDataset, save_waveform
-from validators import AudioSetInstrumentClassifier, DEFAULT_CLASSIFIER_MODEL, InstrumentVocabulary
+from validators import (
+    AudioboxAestheticsScorer,
+    AudioSetInstrumentClassifier,
+    DEFAULT_CLASSIFIER_MODEL,
+    InstrumentVocabulary,
+    LPAPS,
+)
 
 
 RESULT_FIELDS = [
@@ -82,6 +88,15 @@ RESULT_FIELDS = [
     "alpha_min",
     "alpha_max",
     "retain_dominant_ratio",
+    # Populated only for "base" and each "magnituder" experiment;
+    # always None for fixed-alpha/cfg_diff rows, which are out of scope for these.
+    "target_suppression_gain_ast",
+    "lpaps_preservation",
+    "audiobox_ce",
+    "audiobox_cu",
+    "audiobox_pc",
+    "audiobox_pq",
+    "audiobox_mean",
 ]
 PLOT_COLORS = ("#2a78d6", "#d56b25", "#39875b", "#845ec2", "#b64c66", "#6b6b6b")
 
@@ -522,6 +537,18 @@ def summarize(
             "clipping_ratio_mean": float(np.mean([row["clipping_ratio"] for row in method_rows])),
         }
 
+        # Audio Quality (Audiobox Aesthetics): no-reference, so reported for "base" too, not just
+        # paired methods. Populated only for "base"/"magnituder";
+        # a plain mean, like the other per-generation signal checks above, not a
+        # bootstrap CI, since it isn't a "paired vs. base" metric.
+        audiobox_rows = [row for row in method_rows if row["audiobox_mean"] is not None]
+        if audiobox_rows:
+            method_summary["audiobox_ce_mean"] = float(np.mean([row["audiobox_ce"] for row in audiobox_rows]))
+            method_summary["audiobox_cu_mean"] = float(np.mean([row["audiobox_cu"] for row in audiobox_rows]))
+            method_summary["audiobox_pc_mean"] = float(np.mean([row["audiobox_pc"] for row in audiobox_rows]))
+            method_summary["audiobox_pq_mean"] = float(np.mean([row["audiobox_pq"] for row in audiobox_rows]))
+            method_summary["audiobox_mean_mean"] = float(np.mean([row["audiobox_mean"] for row in audiobox_rows]))
+
         if method != "base":
             paired = []
             for row in method_rows:
@@ -551,6 +578,27 @@ def summarize(
             method_summary["fraction_prompts_with_target_reduction"] = float(
                 np.mean([np.mean(values) > 0.0 for values in prompt_gains.values()])
             )
+
+            # Alignment Gain (AST), Preservation (LPAPS): populated only for "magnituder" rows (None elsewhere),
+            #  so aggregate over the subset that actually has them rather than assuming every method_rows entry does.
+            ast_rows = [row for row in method_rows if row["target_suppression_gain_ast"] is not None]
+            if ast_rows:
+                method_summary["target_suppression_gain_ast"] = _mean_ci_by_prompt(
+                    ast_rows, lambda row: row["target_suppression_gain_ast"], bootstrap_samples, rng
+                )
+
+            lpaps_rows = [row for row in method_rows if row["lpaps_preservation"] is not None]
+            if lpaps_rows:
+                method_summary["lpaps_preservation"] = _mean_ci_by_prompt(
+                    lpaps_rows, lambda row: row["lpaps_preservation"], bootstrap_samples, rng
+                )
+
+            # Smoothness (TADA) needs a curve across multiple steering-strength values; the magnituder
+            # predicts a single per-sample magnitude scalar (no sweep), so it is not defined here.
+            # Reported explicitly as null rather than omitted, so the absence isn't mistaken for
+            # an oversight.
+            if ast_rows or lpaps_rows:
+                method_summary["smoothness"] = None
 
         alpha_values = [row["alpha_mean"] for row in method_rows if row["alpha_mean"] is not None]
         if alpha_values:
@@ -603,7 +651,9 @@ def plot_tradeoff(summary: dict, path: Path) -> None:
         y = method_summary["retain_similarity_change"]["mean"]
         ax.scatter(x, y, s=70, color=PLOT_COLORS[index % len(PLOT_COLORS)])
         ax.annotate(method, (x, y), xytext=(6, 5), textcoords="offset points")
-    ax.set_xlabel("Target suppression gain vs base (higher is better)")
+    # "target_suppression_gain" is the field name kept for backward compatibility with existing
+    # summary.json/results.csv consumers; displayed here as "Alignment Gain (CLAP)"
+    ax.set_xlabel("Alignment Gain (CLAP) vs base (higher is better)")
     ax.set_ylabel("Retain-prompt similarity change vs base (higher is better)")
     ax.set_title("Suppression/fidelity trade-off")
     ax.grid(alpha=0.25)
@@ -666,6 +716,9 @@ def run_pipeline(
     alpha_runs: list[dict],
     progress: dict[str, int],
     output_dir: Path,
+    lpaps: LPAPS | None,
+    audiobox: AudioboxAestheticsScorer | None,
+    base_reference: dict[tuple[int, int], dict] | None,
 ) -> None:
     """Runs one pipeline's methods over the full dataset/seed grid, writing paired rows.
 
@@ -674,6 +727,14 @@ def run_pipeline(
     `steering_mode="cfg_diff"`, anything else uses `steering_mode="learned"`. `alpha_bounds` is
     `(alpha_min, alpha_max, alpha_magnitude, quantile_low, quantile_high)`, meaningful only for
     `"cfg_diff"` methods and otherwise an inert pass-through.
+
+    `lpaps`/`audiobox`/`base_reference` are `None` together for pipelines out of scope for the
+    LPAPS/Audiobox/AST-gain metrics (fixed-alpha, cfg_diff): every new-metric column stays `None`
+    for their rows. When in scope (the "base" call and each "magnituder" experiment),
+    `base_reference` is a `{(sample_id, seed): {"waveform", "target_instrument_score"}}`
+    dict shared across those calls: the "base" call populates it, later "magnituder"
+    calls read it to compute paired LPAPS/AST-gain against the same seed's base audio.
+    Audiobox needs no reference, so it is scored for "base" rows too, not just paired ones.
     """
 
     alpha_min, alpha_max, alpha_magnitude, quantile_low, quantile_high = alpha_bounds
@@ -726,6 +787,36 @@ def run_pipeline(
                 records = [(int(step), float(alpha)) for step, alpha in output.alpha_records]
                 alpha_stats = alpha_metrics(records)
 
+                audiobox_scores = {
+                    "audiobox_ce": None, "audiobox_cu": None, "audiobox_pc": None,
+                    "audiobox_pq": None, "audiobox_mean": None,
+                }
+                if audiobox is not None:
+                    scores = audiobox.score(waveform, sampling_rate)
+                    audiobox_scores = {
+                        "audiobox_ce": scores["ce"], "audiobox_cu": scores["cu"],
+                        "audiobox_pc": scores["pc"], "audiobox_pq": scores["pq"],
+                        "audiobox_mean": scores["mean"],
+                    }
+
+                lpaps_preservation = None
+                target_suppression_gain_ast = None
+                if base_reference is not None:
+                    reference_key = (sample_id, sample_seed)
+                    if method_name == "base":
+                        base_reference[reference_key] = {
+                            "waveform": waveform, "target_instrument_score": target_instrument_score,
+                        }
+                    else:
+                        # "base" always runs first (see main()'s call order), so its reference for
+                        # this (sample_id, seed) is guaranteed to already exist here.
+                        reference = base_reference[reference_key]
+                        if lpaps is not None:
+                            lpaps_preservation = lpaps.distance(waveform, reference["waveform"], sampling_rate)
+                        target_suppression_gain_ast = (
+                            reference["target_instrument_score"] - target_instrument_score
+                        )
+
                 if args.save_audio:
                     audio_relative_path = str(
                         Path("audio") / method_name / f"sample_{sample_id:04d}_seed_{sample_seed}.wav"
@@ -746,6 +837,9 @@ def run_pipeline(
                     "retain_similarity": retain_similarity,
                     **signal,
                     **alpha_stats,
+                    **audiobox_scores,
+                    "lpaps_preservation": lpaps_preservation,
+                    "target_suppression_gain_ast": target_suppression_gain_ast,
                 }
                 rows.append(row)
                 writer.writerow(row)
@@ -865,6 +959,11 @@ def main() -> None:
     print(f"Loading instrument classifier {DEFAULT_CLASSIFIER_MODEL} on {device}")
     classifier = AudioSetInstrumentClassifier(vocabulary, model_name=DEFAULT_CLASSIFIER_MODEL, device=str(device))
 
+    print("Loading LPAPS perceptual preservation scorer (downloads/verifies its checkpoint on first use)")
+    lpaps = LPAPS.from_pretrained().to(device)
+    print("Loading Audiobox Aesthetics quality scorer")
+    audiobox = AudioboxAestheticsScorer(device=str(device))
+
     config = {
         "dataset": str(args.dataset.resolve()),
         "output": str(output_dir),
@@ -885,6 +984,8 @@ def main() -> None:
             "revision": classifier.revision,
             "proxy_targets": proxy_targets,
         },
+        "lpaps_source": "github.com/v-iashin/SpecVQGAN vggishish16 (VGGSound-trained, not music-calibrated)",
+        "audiobox_aesthetics_model": audiobox.model_id,
         "base": {"generation": base_generation_config},
         "magnituder_experiments": [
             {
@@ -959,6 +1060,12 @@ def main() -> None:
     alpha_runs: list[dict] = []
     results_path = output_dir / "results.csv"
 
+    # Shared across the "base" and "magnituder" run_pipeline calls only: populated by "base",
+    # read by "magnituder" to compute paired LPAPS/AST-gain against the same seed's base audio.
+    # LPAPS/Audiobox/AST-gain are out of scope for fixed-alpha/cfg_diff, so those calls pass
+    # lpaps=None, audiobox=None, base_reference=None.
+    base_reference: dict[tuple[int, int], dict] = {}
+
     with results_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=RESULT_FIELDS)
         writer.writeheader()
@@ -970,6 +1077,7 @@ def main() -> None:
             base_generation_config,
             INERT_ALPHA_BOUNDS,
             args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+            lpaps, audiobox, base_reference,
         )
 
         # 2. magnituder: one method per row of --experiments-csv, skipped when it was omitted.
@@ -980,9 +1088,10 @@ def main() -> None:
                 experiment["generation_config"],
                 experiment["alpha_bounds"],
                 args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+                lpaps, audiobox, base_reference,
             )
 
-        # 3. fixed-alpha: skipped when --fixed-alpha-values is empty.
+        # 3. fixed-alpha: skipped when --fixed-alpha-values is empty. Out of scope for the new metrics, so their columns stay None.
         if fixed_alpha_methods:
             run_pipeline(
                 pipe, clap, dataset, target_embeds, classifier, canonical_targets,
@@ -990,9 +1099,10 @@ def main() -> None:
                 fixed_alpha_generation_config,
                 INERT_ALPHA_BOUNDS,
                 args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+                None, None, None,
             )
 
-        # 4. cfg-diff: always evaluated, zero-cost and training-free.
+        # 4. cfg-diff: always evaluated, zero-cost and training-free. Out of scope for the new metrics, so their columns stay None.
         run_pipeline(
             pipe, clap, dataset, target_embeds, classifier, canonical_targets,
             {"cfg_diff": (None, "cfg_diff")},
@@ -1005,6 +1115,7 @@ def main() -> None:
                 args.cfg_diff_alpha_quantile_high,
             ),
             args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
+            None, None, None,
         )
 
     summary = summarize(rows, args.bootstrap_samples, args.seed)

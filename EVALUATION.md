@@ -139,14 +139,16 @@ For each generated waveform the evaluator records:
 Paired metrics compare a method with `base` for the same prompt and seed:
 
 ```text
-target suppression gain  = target_similarity(base) - target_similarity(method)
+Alignment Gain (CLAP)    = target_similarity(base) - target_similarity(method)
 retain similarity change = retain_similarity(method) - retain_similarity(base)
 prompt similarity change = prompt_similarity(method) - prompt_similarity(base)
 ```
 
 A positive suppression gain is desirable, and the trade-off plot reads it against the retain
 similarity change: a large gain paired with a negative retain change usually means the audio was
-degraded rather than the concept removed.
+degraded rather than the concept removed. This field is still named `target_suppression_gain` in
+`results.csv`/`summary.json` for backward compatibility; "Alignment Gain (CLAP)" is only the display
+label (see `docs/metriche-valutazione-steering.md`).
 
 Prompt-similarity change is only a coarse fidelity proxy: in the current dataset the full prompt
 includes the target word `trumpet`, so suppressing the target and matching the full prompt are
@@ -158,9 +160,45 @@ Confidence intervals use prompts as the independent units. Results from multiple
 within each prompt before bootstrap resampling, avoiding artificially narrow intervals from treating
 seeds of the same prompt as independent observations.
 
-CLAP is also used by training, so these metrics must be complemented by paired listening and,
-eventually, an independent instrument classifier. RMS, silence and clipping are sanity checks rather
-than perceptual-quality metrics.
+CLAP is also used by training, so these metrics must be complemented by paired listening and an
+independent instrument classifier. RMS, silence and clipping are sanity checks rather than
+perceptual-quality metrics.
+
+### Additional metrics for `base` and `magnituder`
+
+The following four metrics (adapted from TADA, Staniszewski et al., 2026, at the `magnituder`'s
+native operating point rather than via a steering-strength sweep — see
+`docs/metriche-valutazione-steering.md` for the full rationale) are computed only for the `base`
+reference and each `magnituder` experiment; `fixed-alpha` and `cfg_diff` rows always leave these
+columns blank/`null`, a deliberate scope decision, not an oversight.
+
+- **Alignment Gain (AST)** (`target_suppression_gain_ast` in `results.csv`/`summary.json`): the
+  same paired-gain formula as Alignment Gain (CLAP) above, but computed from
+  `target_instrument_score` (the `AudioSetInstrumentClassifier` / AST score) instead of CLAP. A
+  secondary, independent check: AST is a closed-vocabulary classifier, so it can only stand in for
+  the target-suppression comparison, never for `retain_similarity_change`/`prompt_similarity_change`
+  (those require scoring arbitrary free text, which a fixed-class classifier cannot do). Never
+  average or merge the CLAP and AST versions numerically — the underlying scales aren't comparable
+  (cosine similarity vs. sigmoid probability); read them side by side instead.
+- **Preservation (LPAPS)** (`lpaps_preservation`): perceptual distance between a method's audio and
+  the paired `base` audio (same prompt and seed), computed in the feature space of "VGGish-ish", a
+  VGG16-style classifier trained from scratch on VGGSound (Iashin & Rahtu, 2021,
+  `github.com/v-iashin/SpecVQGAN`). Lower is more preserved. **Domain-mismatch caveat**: VGGish-ish
+  is trained on VGGSound (environmental/video sound events), not music, so this is a reasonable
+  approximation of preserved perceptual structure, not a metric calibrated for music. The checkpoint
+  (~140M parameters) is downloaded once from `a3s.fi` and cached under
+  `~/.cache/musicldm-steering-pipeline/lpaps/`; environments without network access to `a3s.fi` (e.g.
+  some CI/offline setups) cannot compute this metric on first run.
+- **Audio Quality (Audiobox Aesthetics)** (`audiobox_ce`/`audiobox_cu`/`audiobox_pc`/`audiobox_pq`/
+  `audiobox_mean`): a no-reference quality score (Content Enjoyment, Content Usefulness, Production
+  Complexity, Production Quality; Tjandra et al., Meta, 2025) computed for every in-scope row,
+  including `base`, since it needs no paired reference. Its checkpoint downloads automatically from
+  the `facebook/audiobox-aesthetics` HuggingFace repo on first use.
+- **Smoothness**: not computed, and not approximated. TADA's Smoothness is defined on the variance
+  between consecutive points of a steering-strength sweep; the `magnituder` predicts a single
+  per-sample `magnitude` scalar with no sweep to speak of (see §4 of this doc and
+  `docs/metriche-valutazione-steering.md`). `summary.json` reports `"smoothness": null` explicitly
+  for `magnituder` methods, so the omission is visible rather than silent.
 
 ## Outputs
 
@@ -180,5 +218,9 @@ audio/
   cfg_diff/
 ```
 
-`results.csv` is the detailed table with one row per prompt, seed and method. `summary.json`
-contains prompt-clustered bootstrap confidence intervals.
+`results.csv` is the detailed table with one row per prompt, seed and method. Besides the metrics
+listed above it also carries `target_suppression_gain_ast`, `lpaps_preservation`, `audiobox_ce`,
+`audiobox_cu`, `audiobox_pc`, `audiobox_pq` and `audiobox_mean` — populated only for `base`/
+`magnituder` rows, blank for `fixed-alpha`/`cfg_diff`. `summary.json` contains prompt-clustered
+bootstrap confidence intervals, plus the plain per-method means for Audiobox Aesthetics and the
+explicit `"smoothness": null` marker for `magnituder` methods.

@@ -6,11 +6,17 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.14.0",
+    "audiobox_aesthetics>=0.0.2",
     "diffusers>=0.39.0",
     "einops>=0.8.2",
     "huggingface-hub>=1.7.1",
+    "librosa>=0.10.2",
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
+    # unpickling the LPAPS/vggishish16 checkpoint (validators/lpaps.py) needs this installed, even
+    # though only its plain-tensor "model" entry is ever read
+    "omegaconf>=2.3.0",
+    "requests>=2.32.0",
     "safetensors>=0.7.0",
     "soundfile>=0.13.1",
     "stable-audio-3",
@@ -59,4 +65,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["losses", "pipelines", "utils"]
+packages = ["losses", "pipelines", "utils", "validators"]

@@ -29,8 +29,8 @@ from stable_audio_3.models.lora import has_lora
 
 from pipelines.cfg_diff_alpha import compute_cfg_diff_alpha, compute_cfg_diff_shape
 
-# Stamped into `MagnitudePredictor` checkpoints trained against `"cfg_diff_magnitude"` mode (Regime
-# B): a predictor is only meaningful for the backbone and the guidance formula it was fitted against,
+# Stamped into `MagnitudePredictor` checkpoints trained against `"cfg_diff_magnitude"` mode:
+# a predictor is only meaningful for the backbone and the guidance formula it was fitted against,
 # so the evaluator rejects a checkpoint whose stamp doesn't match.
 STEERING_MODE_MAGNITUDE = "sa3_cfg_diff_magnitude_v1"
 
