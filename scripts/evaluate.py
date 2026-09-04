@@ -248,9 +248,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     cfg_diff.add_argument("--cfg-diff-alpha-min", type=float, default=0.0, help="lower bound of cfg_diff's alpha_t")
-    cfg_diff.add_argument("--cfg-diff-alpha-max", type=float, default=5.0, help="upper bound of cfg_diff's alpha_t")
+    cfg_diff.add_argument("--cfg-diff-alpha-max", type=float, default=1.0, help="upper bound of cfg_diff's alpha_t")
     cfg_diff.add_argument(
-        "--cfg-diff-alpha-magnitude", type=float, default=0.6, help="global gain in [0, 1] for cfg_diff's alpha_t"
+        "--cfg-diff-alpha-magnitude", type=float, default=0.9, help="global gain in [0, 1] for cfg_diff's alpha_t"
     )
     cfg_diff.add_argument(
         "--cfg-diff-alpha-quantile-low",
