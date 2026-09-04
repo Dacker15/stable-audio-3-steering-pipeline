@@ -10,6 +10,9 @@ generation settings are read from its own checkpoint's stored training args, not
 since a sweep's rows can use different steering windows; ``fixed-alpha`` and ``cfg-diff`` remain
 configured exclusively from their own prefixed CLI parameters, so passing e.g.
 ``--cfg-diff-cfg-scale`` never affects the other pipelines' generation settings and vice versa.
+The paired LPAPS/AST-gain/Audiobox metrics are computed for ``base``, ``magnituder`` and
+``cfg-diff`` (not ``fixed-alpha``), so ``cfg-diff`` can be compared directly against
+``magnituder`` on the same axes.
 
 Example smoke test (using the CSV produced by ``scripts/train.py``):
 
@@ -88,8 +91,8 @@ RESULT_FIELDS = [
     "alpha_min",
     "alpha_max",
     "retain_dominant_ratio",
-    # Populated only for "base" and each "magnituder" experiment;
-    # always None for fixed-alpha/cfg_diff rows, which are out of scope for these.
+    # Populated for "base", each "magnituder" experiment, and "cfg_diff";
+    # always None for fixed-alpha rows, which are out of scope for these.
     "target_suppression_gain_ast",
     "lpaps_preservation",
     "audiobox_ce",
@@ -579,8 +582,9 @@ def summarize(
                 np.mean([np.mean(values) > 0.0 for values in prompt_gains.values()])
             )
 
-            # Alignment Gain (AST), Preservation (LPAPS): populated only for "magnituder" rows (None elsewhere),
-            #  so aggregate over the subset that actually has them rather than assuming every method_rows entry does.
+            # Alignment Gain (AST), Preservation (LPAPS): populated only for "magnituder"/"cfg_diff" rows
+            # (None for "fixed-alpha"), so aggregate over the subset that actually has them rather than
+            # assuming every method_rows entry does.
             ast_rows = [row for row in method_rows if row["target_suppression_gain_ast"] is not None]
             if ast_rows:
                 method_summary["target_suppression_gain_ast"] = _mean_ci_by_prompt(
@@ -593,8 +597,9 @@ def summarize(
                     lpaps_rows, lambda row: row["lpaps_preservation"], bootstrap_samples, rng
                 )
 
-            # Smoothness (TADA) needs a curve across multiple steering-strength values; the magnituder
-            # predicts a single per-sample magnitude scalar (no sweep), so it is not defined here.
+            # Smoothness (TADA) needs a curve across multiple steering-strength values; neither the
+            # magnituder (a single per-sample magnitude scalar) nor cfg_diff (a single deterministic
+            # alpha_t schedule per sample) sweeps steering strength, so it is not defined here.
             # Reported explicitly as null rather than omitted, so the absence isn't mistaken for
             # an oversight.
             if ast_rows or lpaps_rows:
@@ -729,10 +734,10 @@ def run_pipeline(
     `"cfg_diff"` methods and otherwise an inert pass-through.
 
     `lpaps`/`audiobox`/`base_reference` are `None` together for pipelines out of scope for the
-    LPAPS/Audiobox/AST-gain metrics (fixed-alpha, cfg_diff): every new-metric column stays `None`
-    for their rows. When in scope (the "base" call and each "magnituder" experiment),
-    `base_reference` is a `{(sample_id, seed): {"waveform", "target_instrument_score"}}`
-    dict shared across those calls: the "base" call populates it, later "magnituder"
+    LPAPS/Audiobox/AST-gain metrics (fixed-alpha): every new-metric column stays `None`
+    for their rows. When in scope (the "base" call, each "magnituder" experiment, and the
+    "cfg_diff" call), `base_reference` is a `{(sample_id, seed): {"waveform", "target_instrument_score"}}`
+    dict shared across those calls: the "base" call populates it, later "magnituder"/"cfg_diff"
     calls read it to compute paired LPAPS/AST-gain against the same seed's base audio.
     Audiobox needs no reference, so it is scored for "base" rows too, not just paired ones.
     """
@@ -1060,9 +1065,9 @@ def main() -> None:
     alpha_runs: list[dict] = []
     results_path = output_dir / "results.csv"
 
-    # Shared across the "base" and "magnituder" run_pipeline calls only: populated by "base",
-    # read by "magnituder" to compute paired LPAPS/AST-gain against the same seed's base audio.
-    # LPAPS/Audiobox/AST-gain are out of scope for fixed-alpha/cfg_diff, so those calls pass
+    # Shared across the "base", "magnituder" and "cfg_diff" run_pipeline calls: populated by "base",
+    # read by "magnituder"/"cfg_diff" to compute paired LPAPS/AST-gain against the same seed's base
+    # audio. LPAPS/Audiobox/AST-gain are out of scope for fixed-alpha only, so that call passes
     # lpaps=None, audiobox=None, base_reference=None.
     base_reference: dict[tuple[int, int], dict] = {}
 
@@ -1102,7 +1107,9 @@ def main() -> None:
                 None, None, None,
             )
 
-        # 4. cfg-diff: always evaluated, zero-cost and training-free. Out of scope for the new metrics, so their columns stay None.
+        # 4. cfg-diff: always evaluated, zero-cost and training-free. In scope for the new metrics (like
+        # "magnituder") so it can be compared against "magnituder" on the same axes; "base" already ran
+        # first, so base_reference already holds every (sample_id, seed) pair by the time this call reads it.
         run_pipeline(
             pipe, clap, dataset, target_embeds, classifier, canonical_targets,
             {"cfg_diff": (None, "cfg_diff")},
@@ -1115,7 +1122,7 @@ def main() -> None:
                 args.cfg_diff_alpha_quantile_high,
             ),
             args, device, sampling_rate, writer, csv_file, rows, alpha_runs, progress, output_dir,
-            None, None, None,
+            lpaps, audiobox, base_reference,
         )
 
     summary = summarize(rows, args.bootstrap_samples, args.seed)
