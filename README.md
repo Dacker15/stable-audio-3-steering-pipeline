@@ -1,30 +1,14 @@
 # Stable Audio 3 Steering Pipeline
 
-The current experiment learns target-specific steering for one instrument (`trumpet`) by
-interpolating between full-prompt and retain-prompt classifier-free guidance.
+This project focuses on applying a target-specific steering on Stable Audio 3 by
+interpolating between full-prompt and retain-prompt classifier-free guidance. 
 
-Stable Audio 3 is not supported by diffusers, so the steering is not a pipeline subclass: it
-overrides `DiffusionTransformer.forward`, the component of the `stable_audio_3` library where
+We used `stable_audio_3` library to override `DiffusionTransformer.forward`, where
 classifier-free guidance is actually computed. See `pipelines/steering_stable_audio_pipeline.py`.
 
 Only the `-base` checkpoints work. The post-trained ones (`small-music`, `medium`, `small-sfx`) are
-distilled and ignore `cfg_scale`, and steering lives inside the guidance branch. The default is
-`medium-base`; `small-music-base` is the lighter fallback. Both are gated on HuggingFace, so accept
-the licence on the model page and authenticate with `hf auth login` or an `HF_TOKEN` variable first.
-
-## Prepare the simplified dataset
-
-Place `trumpet_prompts_simple_dataset.csv` in `datasets/`, then create deterministic group-aware
-splits. Each pair of equivalent prompt templates stays in the same split.
-
-```powershell
-uv run scripts/create_simple_splits.py `
-  --input datasets/trumpet_prompts_simple_dataset.csv `
-  --output-dir datasets/trumpet_simple_splits `
-  --seed 42
-```
-
-This creates 132 training rows, 44 validation rows and 44 test rows.
+distilled and ignore `cfg_scale`, and steering lives inside the guidance branch.
+The default is `small-music-base` since `medium-base` is too heavy to train. The models are available on HuggingFace.
 
 ## Train
 
@@ -33,29 +17,25 @@ deterministic CFG-diff shape (`steering_mode="cfg_diff_magnitude"`), in contrast
 `magnitude` hyperparameter `steering_mode="cfg_diff"` uses.
 
 ```powershell
-uv run scripts/train_regime_b.py `
-  --dataset datasets/trumpet_simple_splits/train.csv `
-  --output outputs/trumpet-regime-b `
-  --epochs 5 --margin-target 0.30 --margin-retain 0.40 `
-  --lambda-reg 0.01 --lambda-reg-warmup-steps 200 --lambda-fid 0.1
+uv run scripts/train.py `
+  --dataset datasets/train_set.csv `
+  --validation-dataset datasets/validation_set `
+  --output outputs/small-music-base-training `
+  --experiments-csv experiments/base.csv
 ```
-
-CLAP is loaded on its own — Stable Audio 3 conditions on T5Gemma — and provides both the loss and
-the target embedding the predictor is conditioned on. `scripts/evaluate.py` also has a zero-cost,
-training-free `cfg-diff` method that needs no checkpoint at all.
 
 ## Evaluate
 
+`scripts/evaluate.py` is used to evaluate the different output models provided by `scripts/train.py`.
+It also has a zero-cost, training-free `cfg-diff` method that needs no checkpoint at all.
+
 ```powershell
 uv run scripts/evaluate.py `
-  --dataset datasets/trumpet_simple_splits/validation.csv `
-  --magnituder-checkpoint outputs/trumpet-regime-b/magnitude_predictor_best.pt `
-  --output outputs/trumpet-regime-b-validation
+  --dataset datasets/test_csv.csv `
+  --experiments-csv outputs/small-music-base-training/experiments.csv`
+  --output  outputs/small-music-base-evaluate
 ```
-
-See [EVALUATION.md](EVALUATION.md) for the full paired evaluation workflow.
 
 ## Plain generation
 
-`scripts/generate_audio_stable_audio_3.py` generates with the stock Stable Audio 3, which is the
-unsteered reference the evaluation can be sanity-checked against.
+`scripts/generate_audio_stable_audio_3.py` generates with the stock Stable Audio 3, which is the unsteered reference the evaluation can be sanity-checked against.
